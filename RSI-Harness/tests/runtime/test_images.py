@@ -1,0 +1,1473 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+from importlib import resources
+from pathlib import Path, PurePosixPath
+from uuid import uuid4
+
+import pytest
+
+from rsi_harness.errors import SetupError
+from rsi_harness.integrations.rsi_loop import AGENT_SHELL
+from rsi_harness.models import (
+    AgentPlan,
+    GPUAllocation,
+    GPURequirement,
+    JudgeGPUMode,
+    MainServiceConfig,
+    RootfsSnapshotMode,
+    RunGPUPlan,
+    RunPaths,
+    TaskDefinition,
+    VerifierPlan,
+)
+from rsi_harness.runtime import images as images_module
+from rsi_harness.runtime.images import (
+    DockerImageBuilder,
+    build_agent_identity_script,
+    resolve_image_workdir,
+    resolve_rootfs_snapshot_mode,
+)
+from rsi_harness.runtime.mount_topology import validate_run_plan_mount_topology
+from rsi_harness.task.compiler import HarborTaskCompiler
+from rsi_loop import __version__ as rsi_loop_version
+from rsi_loop.harness.agent import create_agent, versions
+from rsi_loop.harness.agent import factory as agent_factory
+from rsi_loop.harness.agent.driven import DrivenAgent
+from rsi_loop.harness.config import RSILoopConfig
+from tests.fakes import (
+    FakeDockerClient,
+    FakeDockerImage,
+    FakeDrivenAgent,
+    register_fake_driven_agent,
+)
+
+RSI_LOOP_VERSION = rsi_loop_version
+
+
+def task_definition(
+    tmp_path: Path,
+    *,
+    image: str | None = None,
+    workdir: PurePosixPath | str | None = PurePosixPath("/workspace"),
+    agent_user: str | None = "1001",
+    verifier_user: str | None = "1002",
+    service_user: str | None = None,
+) -> TaskDefinition:
+    source = tmp_path / "task"
+    environment = source / "environment"
+    tests = source / "tests"
+    environment.mkdir(parents=True)
+    tests.mkdir()
+    (environment / "Dockerfile").write_text("FROM ubuntu:24.04\nWORKDIR /workspace\n")
+    (environment / "environment-only.txt").write_text("base input")
+    (tests / "test.sh").write_text("secret verifier")
+    (source / "solution.sh").write_text("secret solution")
+    return TaskDefinition(
+        task_id="minimal-gpu",
+        source_dir=source.resolve(),
+        source_digest="source-digest",
+        instruction_digest="instruction-digest",
+        tests_digest="tests-digest",
+        environment_digest="environment-digest-abcdef",
+        workdir=workdir,
+        service=MainServiceConfig(
+            build_context=None if image else environment.resolve(),
+            image=image,
+            workdir=workdir,
+            user=service_user,
+        ),
+        gpu_requirement=GPURequirement(count=1),
+        verifier=VerifierPlan(
+            command=("/bin/bash", "/tests/test.sh"), user=verifier_user
+        ),
+        agent=AgentPlan(name="codex", user=agent_user),
+    )
+
+
+def test_dockerfile_base_uses_only_environment_and_work_is_derived_independently(
+    tmp_path,
+):
+    client = FakeDockerClient()
+    task = task_definition(tmp_path)
+    agent = create_agent("codex", RSILoopConfig())
+    builder = DockerImageBuilder(
+        client,
+        run_id="run-7",
+        rsi_loop_version=RSI_LOOP_VERSION,
+        bootstrap_version="7",
+    )
+
+    plan = builder.prepare(task, agent=agent)
+
+    assert len(client.images.built) == 2
+    base_build, work_build = client.images.built
+    assert Path(base_build["path"]) == task.source_dir / "environment"
+    assert set(base_build["context_files"]) == {
+        "Dockerfile",
+        "environment-only.txt",
+    }
+    assert set(work_build["context_files"]) == {"Dockerfile", "rsi-submit"}
+    assert base_build["labels"] == {
+        "rsi-harness.run-id": "run-7",
+        "rsi-harness.task-id": "minimal-gpu",
+        "rsi-harness.role": "judge",
+    }
+    assert work_build["labels"] == {
+        "rsi-harness.run-id": "run-7",
+        "rsi-harness.task-id": "minimal-gpu",
+        "rsi-harness.role": "work",
+    }
+    assert "secret verifier" not in repr(client.images.built)
+    assert "secret solution" not in repr(client.images.built)
+    assert "environment-digest-abcdef" in work_build["tag"]
+    assert "codex" in work_build["tag"]
+    assert "1.0.0-rsi.1" in work_build["tag"]
+    assert "v7" in work_build["tag"]
+    assert plan.work_ref != plan.base_ref
+    assert plan.judge_ref == plan.base_ref
+    assert plan.judge_digest == plan.base_digest
+    assert plan.work_digest != plan.base_digest
+    assert "rsi-submit" in work_build["context_files"]["Dockerfile"]
+    dockerfile = work_build["context_files"]["Dockerfile"]
+    assert f"@openai/codex@{versions.CODEX}" in dockerfile
+    assert "@openai/codex@0.147.0" not in dockerfile
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "package"),
+    [
+        ("codex", f"@openai/codex@{versions.CODEX}"),
+        ("claude-code", f"@anthropic-ai/claude-code@{versions.CLAUDE_CODE}"),
+        ("qwen-code", f"--ignore-scripts @qwen-code/qwen-code@{versions.QWEN_CODE}"),
+        ("kimi-code", f"--ignore-scripts @moonshot-ai/kimi-code@{versions.KIMI_CODE}"),
+    ],
+)
+def test_agent_images_pin_cli_and_compatible_node_versions(agent_name, package):
+    dockerfile = DockerImageBuilder(None)._work_dockerfile(
+        agent=create_agent(agent_name, RSILoopConfig()),
+        base_ref="ubuntu:24.04",
+        workdir=PurePosixPath("/workspace"),
+        final_user="1001",
+    )
+
+    assert f"npm install -g {package}" in dockerfile
+    node = versions.NODE_VERSION
+    assert f"/v{node}/node-v{node}-linux-${{arch}}.tar.xz" in dockerfile
+    assert "x86_64) arch=x64 ;; aarch64|arm64) arch=arm64 ;;" in dockerfile
+    assert "node-v20." not in dockerfile
+
+
+def test_work_cache_identity_uses_rsi_loop_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The former product-version key would incorrectly reuse cached Work images."""
+    captured_identities: list[dict[str, object]] = []
+    original_dumps = images_module.json.dumps
+
+    def capture_identity(value: object, *args: object, **kwargs: object) -> str:
+        if isinstance(value, dict) and "base_digest" in value:
+            captured_identities.append(value)
+        return original_dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(images_module.json, "dumps", capture_identity)
+    DockerImageBuilder(None, rsi_loop_version=RSI_LOOP_VERSION)._work_tag(
+        task_definition(tmp_path),
+        create_agent("codex", RSILoopConfig()),
+        base_digest="sha256:base",
+        effective_user="1001",
+        workdir=PurePosixPath("/workspace"),
+        dockerfile="FROM base",
+        submit_client="submit client",
+    )
+
+    assert captured_identities == [
+        {
+            "base_digest": "sha256:base",
+            "effective_user": "1001",
+            "workdir": "/workspace",
+            "dockerfile": "FROM base",
+            "submit_client": "submit client",
+            "image_labels": {
+                "rsi-harness.run-id": "image-preparation",
+                "rsi-harness.task-id": "minimal-gpu",
+                "rsi-harness.role": "work",
+            },
+            "rsi_loop_version": RSI_LOOP_VERSION,
+            "bootstrap_version": "1",
+        }
+    ]
+    image_identity = captured_identities[0]
+    assert image_identity["rsi_loop_version"] == RSI_LOOP_VERSION
+    assert "sforge_version" not in image_identity
+
+
+def test_image_builds_use_harbor_environment_timeout(tmp_path) -> None:
+    client = FakeDockerClient()
+    task = task_definition(tmp_path)
+    task = task.model_copy(
+        update={
+            "service": task.service.model_copy(update={"build_timeout_seconds": 1800.0})
+        }
+    )
+
+    DockerImageBuilder(client).prepare(
+        task, agent=create_agent("codex", RSILoopConfig())
+    )
+
+    assert [build["timeout"] for build in client.images.built] == [1800, 1800]
+
+
+def test_prebuilt_image_is_pulled_when_absent_and_pinned_by_repo_digest(tmp_path):
+    client = FakeDockerClient()
+    task = task_definition(
+        tmp_path,
+        image="registry.test/base:latest",
+        agent_user=None,
+        verifier_user=None,
+    )
+    pulled = FakeDockerImage(
+        "sha256:base-id",
+        {
+            "Id": "sha256:base-id",
+            "RepoDigests": ["registry.test/base@sha256:deadbeef"],
+            "Config": {"WorkingDir": "/workspace", "User": "1000"},
+        },
+    )
+
+    def pull(ref: str):
+        client.images.pulled.append(ref)
+        client.images.by_ref[ref] = pulled
+        return pulled
+
+    client.images.pull = pull
+    plan = DockerImageBuilder(client).prepare(
+        task, agent=create_agent("codex", RSILoopConfig())
+    )
+
+    assert client.images.pulled == ["registry.test/base:latest"]
+    assert plan.base_ref == "registry.test/base@sha256:deadbeef"
+    assert plan.base_digest == "sha256:base-id"
+    assert plan.judge_ref == plan.base_ref
+    assert plan.work_user == "1000"
+    assert plan.judge_user == "1000"
+
+
+@pytest.mark.parametrize("configured", [None, PurePosixPath("/configured")])
+def test_workdir_uses_configuration_or_non_root_image_metadata(configured):
+    image = FakeDockerImage(
+        "sha256:x",
+        {
+            "Id": "sha256:x",
+            "RepoDigests": [],
+            "Config": {"WorkingDir": "/from-image", "User": ""},
+        },
+    )
+
+    assert resolve_image_workdir(configured, image) == (
+        configured or PurePosixPath("/from-image")
+    )
+
+
+@pytest.mark.parametrize("workdir", ["", ".", "/"])
+def test_image_without_workdir_uses_docker_root(workdir):
+    image = FakeDockerImage(
+        "sha256:x",
+        {
+            "Id": "sha256:x",
+            "RepoDigests": [],
+            "Config": {"WorkingDir": workdir, "User": ""},
+        },
+    )
+
+    assert resolve_image_workdir(None, image) == PurePosixPath("/")
+
+
+@pytest.mark.parametrize(
+    ("configured", "image_workdir", "expected_workdir", "expected_mode"),
+    [
+        (
+            PurePosixPath("/workspace"),
+            "/image-cwd",
+            PurePosixPath("/workspace"),
+            RootfsSnapshotMode.SPLIT_WORKDIR,
+        ),
+        (
+            None,
+            "/image-cwd",
+            PurePosixPath("/image-cwd"),
+            RootfsSnapshotMode.SPLIT_WORKDIR,
+        ),
+        ("", "/image-cwd", PurePosixPath("/"), RootfsSnapshotMode.FULL_ROOTFS),
+        (".", "/image-cwd", PurePosixPath("/"), RootfsSnapshotMode.FULL_ROOTFS),
+        (None, "", PurePosixPath("/"), RootfsSnapshotMode.FULL_ROOTFS),
+        (
+            PurePosixPath("/"),
+            "/image-cwd",
+            PurePosixPath("/"),
+            RootfsSnapshotMode.FULL_ROOTFS,
+        ),
+    ],
+)
+def test_image_plan_resolves_effective_workdir_and_snapshot_mode(
+    tmp_path, configured, image_workdir, expected_workdir, expected_mode
+):
+    """Changing the image or declared WORKDIR must choose the matching mode."""
+    task = task_definition(tmp_path, workdir=configured, image="task:latest")
+    client = FakeDockerClient()
+    client.images.by_ref["task:latest"] = FakeDockerImage(
+        image_id="sha256:" + "a" * 64,
+        attrs={
+            "Config": {"WorkingDir": image_workdir, "User": "", "Volumes": None},
+            "RepoDigests": ["task@sha256:" + "b" * 64],
+        },
+    )
+
+    plan = DockerImageBuilder(client).prepare(
+        task, agent=create_agent("codex", RSILoopConfig())
+    )
+
+    assert plan.workdir == expected_workdir
+    assert plan.rootfs_snapshot_mode is expected_mode
+
+
+@pytest.mark.parametrize(
+    ("configured", "image_workdir", "expected"),
+    [
+        (PurePosixPath("/tests"), "/image-cwd", PurePosixPath("/tests")),
+        (None, "/logs", PurePosixPath("/logs")),
+    ],
+)
+def test_finalized_topology_rejects_configured_and_image_fallback_overlap(
+    tmp_path, configured, image_workdir, expected
+):
+    """Both WORKDIR provenance paths must reach the immutable topology guard."""
+    task = task_definition(
+        tmp_path,
+        image="task:latest",
+        workdir=configured,
+    )
+    client = FakeDockerClient()
+    client.images.by_ref["task:latest"] = FakeDockerImage(
+        image_id="sha256:" + "a" * 64,
+        attrs={
+            "Config": {
+                "WorkingDir": image_workdir,
+                "User": "",
+                "Volumes": None,
+            },
+            "RepoDigests": ["task@sha256:" + "b" * 64],
+        },
+    )
+    images = DockerImageBuilder(client).prepare(
+        task, agent=create_agent("codex", RSILoopConfig())
+    )
+    run_plan = HarborTaskCompiler().finalize(
+        task,
+        images,
+        RunGPUPlan(
+            authorized_pool=GPUAllocation(),
+            work=GPUAllocation(),
+            judge=GPUAllocation(),
+            judge_mode=JudgeGPUMode.FREEZE_ONLY,
+        ),
+        RunPaths(
+            root=(tmp_path / "run").resolve(),
+            workspace=(tmp_path / "run" / "workspace").resolve(),
+            logs=(tmp_path / "logs").resolve(),
+        ),
+        "docker-rootfs",
+    )
+
+    assert run_plan.workdir == expected
+    with pytest.raises(SetupError, match="mount topology"):
+        validate_run_plan_mount_topology(run_plan)
+
+
+def test_root_workdir_requires_full_rootfs_snapshot_mode():
+    """A non-root classification would omit mutations below Docker's root."""
+    assert resolve_rootfs_snapshot_mode(PurePosixPath("/")) is (
+        RootfsSnapshotMode.FULL_ROOTFS
+    )
+
+
+@pytest.mark.parametrize("workdir", ["relative", "relative/..", "/workspace/.."])
+def test_relative_or_traversing_image_workdir_is_rejected(workdir):
+    image = FakeDockerImage(
+        "sha256:x",
+        {
+            "Id": "sha256:x",
+            "RepoDigests": [],
+            "Config": {"WorkingDir": workdir, "User": ""},
+        },
+    )
+
+    with pytest.raises(SetupError, match="absolute WORKDIR"):
+        resolve_image_workdir(None, image)
+
+
+@pytest.mark.parametrize("volumes", [{}, None])
+def test_image_without_declared_volumes_is_prepared(tmp_path, volumes):
+    client = FakeDockerClient()
+    task = task_definition(tmp_path, image="registry.test/base:latest")
+    client.images.by_ref[task.service.image] = FakeDockerImage(
+        "sha256:base-id",
+        {
+            "Id": "sha256:base-id",
+            "RepoDigests": ["registry.test/base@sha256:deadbeef"],
+            "Config": {"WorkingDir": "/workspace", "User": "", "Volumes": volumes},
+        },
+    )
+
+    DockerImageBuilder(client).prepare(
+        task, agent=create_agent("codex", RSILoopConfig())
+    )
+
+    assert len(client.images.built) == 1
+
+
+def test_image_with_declared_volumes_is_rejected_before_work_creation(tmp_path):
+    client = FakeDockerClient()
+    task = task_definition(tmp_path, image="registry.test/base:latest")
+    client.images.by_ref[task.service.image] = FakeDockerImage(
+        "sha256:base-id",
+        {
+            "Id": "sha256:base-id",
+            "RepoDigests": ["registry.test/base@sha256:deadbeef"],
+            "Config": {
+                "WorkingDir": "/workspace",
+                "User": "",
+                "Volumes": {"/data": {}},
+            },
+        },
+    )
+
+    with pytest.raises(SetupError, match="declares volumes"):
+        DockerImageBuilder(client).prepare(
+            task, agent=create_agent("codex", RSILoopConfig())
+        )
+
+    assert client.images.built == []
+    assert client.containers.runs == []
+
+
+def test_dynamic_preflight_uses_phase_users_and_agent_home(tmp_path):
+    client = FakeDockerClient()
+    task = task_definition(tmp_path, agent_user="1001", verifier_user="1002")
+
+    DockerImageBuilder(client).prepare(
+        task, agent=create_agent("codex", RSILoopConfig())
+    )
+
+    work, judge = client.containers.runs
+    assert work["user"] == "1001"
+    assert work["environment"] == {
+        "HOME": "/home/agent",
+        "NVIDIA_VISIBLE_DEVICES": "void",
+    }
+    assert "id -u agent" in work["command"][2]
+    assert 'id -u)"' in work["command"][2]
+    assert 'id -g)"' in work["command"][2]
+    assert "id -u 1001" not in work["command"][2]
+    assert "test -w /workspace" in work["command"][2]
+    assert judge["user"] == "1002"
+    assert judge["command"] == ["/bin/sh", "-c", "test -d /workspace"]
+    assert judge["environment"] == {"NVIDIA_VISIBLE_DEVICES": "void"}
+    assert work["network_mode"] == "none"
+    assert judge["network_mode"] == "none"
+    assert work["labels"]["rsi-harness.role"] == "work"
+    assert judge["labels"]["rsi-harness.role"] == "judge"
+    assert work["labels"]["rsi-harness.task-id"] == "minimal-gpu"
+
+    hook_commands = [call["command"] for call in client.api.exec_create_calls]
+    # Only the selected Agent's hook is installed in its Work image.
+    assert not any(
+        isinstance(command, tuple)
+        and command[-1] == "/home/agent/.claude/settings.json"
+        for command in hook_commands
+    )
+    assert any(
+        isinstance(command, list) and "chown -R agent:agent" in command[-1]
+        for command in hook_commands
+    )
+
+
+def test_disabled_stop_hook_skips_image_hook_preflight(tmp_path) -> None:
+    client = FakeDockerClient()
+    task = task_definition(tmp_path)
+    task = task.model_copy(
+        update={"agent": task.agent.model_copy(update={"install_stop_hook": False})}
+    )
+
+    DockerImageBuilder(client).prepare(
+        task, agent=create_agent("codex", RSILoopConfig())
+    )
+
+    assert client.api.exec_create_calls == []
+
+
+def test_service_user_is_shared_fallback_for_work_image_and_both_phases(
+    tmp_path,
+) -> None:
+    client = FakeDockerClient()
+    task = task_definition(
+        tmp_path,
+        agent_user=None,
+        verifier_user=None,
+        service_user="2001:2002",
+    )
+
+    plan = DockerImageBuilder(client).prepare(
+        task, agent=create_agent("codex", RSILoopConfig())
+    )
+
+    work_build = client.images.built[-1]
+    assert "USER 2001:2002" in work_build["context_files"]["Dockerfile"]
+    work, judge = client.containers.runs
+    assert work["user"] == "2001:2002"
+    assert judge["user"] == "2001:2002"
+    assert plan.work_user == "2001:2002"
+    assert plan.judge_user == "2001:2002"
+
+
+def test_work_cache_changes_with_base_user_workdir_and_generated_client(
+    tmp_path, monkeypatch
+):
+    client = FakeDockerClient()
+    image_ref = "registry.test/base:latest"
+    first_base = FakeDockerImage(
+        "sha256:base-one",
+        {
+            "Id": "sha256:base-one",
+            "RepoDigests": [],
+            "Config": {"WorkingDir": "/workspace", "User": "1000"},
+        },
+    )
+    second_base = FakeDockerImage(
+        "sha256:base-two",
+        {
+            "Id": "sha256:base-two",
+            "RepoDigests": [],
+            "Config": {"WorkingDir": "/workspace", "User": "1000"},
+        },
+    )
+    client.images.by_ref[image_ref] = first_base
+    builder = DockerImageBuilder(client)
+    agent = create_agent("codex", RSILoopConfig())
+    builder.prepare(task_definition(tmp_path / "one", image=image_ref), agent=agent)
+    first_tag = client.images.built[-1]["tag"]
+
+    client.images.by_ref[image_ref] = second_base
+    builder.prepare(task_definition(tmp_path / "two", image=image_ref), agent=agent)
+    second_tag = client.images.built[-1]["tag"]
+
+    user_task = task_definition(tmp_path / "three", image=image_ref, agent_user="2002")
+    builder.prepare(user_task, agent=agent)
+    user_tag = client.images.built[-1]["tag"]
+
+    import rsi_harness.runtime.images as images_module
+
+    monkeypatch.setattr(
+        images_module,
+        "generate_submit_client",
+        lambda: "#!/bin/sh\necho changed-client\n",
+    )
+    builder.prepare(
+        task_definition(tmp_path / "four", image=image_ref, agent_user="2002"),
+        agent=agent,
+    )
+    client_tag = client.images.built[-1]["tag"]
+
+    DockerImageBuilder(client, run_id="different-run").prepare(
+        task_definition(tmp_path / "five", image=image_ref, agent_user="2002"),
+        agent=agent,
+    )
+    configuration_tag = client.images.built[-1]["tag"]
+
+    assert len({first_tag, second_tag, user_tag, client_tag, configuration_tag}) == 5
+
+
+def test_build_failure_reports_the_agent_setup_boundary(tmp_path):
+    from docker.errors import BuildError
+
+    client = FakeDockerClient()
+    task = task_definition(tmp_path)
+    original_build = client.images.build
+
+    def fail_work_build(**kwargs):
+        if kwargs["tag"].startswith("rsi-harness-work:"):
+            raise BuildError("RUN npm install failed", [])
+        return original_build(**kwargs)
+
+    client.images.build = fail_work_build
+
+    with pytest.raises(SetupError, match="codex.*pinned install commands"):
+        DockerImageBuilder(client).prepare(
+            task, agent=create_agent("codex", RSILoopConfig())
+        )
+
+
+def test_image_builder_drains_returned_docker_build_logs(tmp_path: Path) -> None:
+    class BuildLogStream:
+        def __init__(self) -> None:
+            self._events = iter(({"stream": "one"}, {"stream": "two"}))
+            self.exhausted = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            try:
+                return next(self._events)
+            except StopIteration:
+                self.exhausted = True
+                raise
+
+    client = FakeDockerClient()
+    original_build = client.images.build
+    streams: list[BuildLogStream] = []
+
+    def build_with_tracked_logs(**kwargs):
+        image, _logs = original_build(**kwargs)
+        stream = BuildLogStream()
+        streams.append(stream)
+        return image, stream
+
+    client.images.build = build_with_tracked_logs
+
+    DockerImageBuilder(client).prepare(
+        task_definition(tmp_path), agent=create_agent("codex", RSILoopConfig())
+    )
+
+    assert len(streams) == 2
+    assert all(stream.exhausted for stream in streams)
+
+
+@pytest.mark.integration
+def test_generated_work_dockerfile_with_multiline_bootstrap_passes_docker_check(
+    tmp_path: Path,
+) -> None:
+    probe = subprocess.run(
+        ["docker", "version"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip(f"Docker parser capability unavailable: {probe.stderr}")
+
+    dockerfile = DockerImageBuilder(None)._work_dockerfile(
+        agent=create_agent("codex", RSILoopConfig()),
+        base_ref="ubuntu:24.04",
+        workdir=PurePosixPath("/workspace"),
+        final_user="0",
+    )
+    (tmp_path / "rsi-submit").write_text("#!/bin/sh\nexit 0\n")
+
+    result = subprocess.run(
+        ["docker", "build", "--check", "-f", "-", "."],
+        cwd=tmp_path,
+        input=dockerfile,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.integration
+def test_work_image_replaces_a_preexisting_registered_agent_launcher(
+    tmp_path: Path,
+) -> None:
+    probe = subprocess.run(
+        ["docker", "version"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip(f"Docker build capability unavailable: {probe.stderr}")
+
+    identity = uuid4().hex
+    base_tag = f"rsi-harness-test:preexisting-agent-launcher-base-{identity}"
+    work_tag = f"rsi-harness-test:preexisting-agent-launcher-work-{identity}"
+    base = tmp_path / "base"
+    work = tmp_path / "work"
+    base.mkdir()
+    work.mkdir()
+    (base / "Dockerfile").write_text(
+        "FROM alpine:latest\n"
+        "RUN printf '#!/bin/sh\\nexit 91\\n' > /usr/local/bin/codex "
+        "&& chmod 0755 /usr/local/bin/codex\n"
+    )
+    agent = type(
+        "RegisteredAgent",
+        (),
+        {
+            "name": "codex",
+            "run_cmd": "codex exec --dangerously-bypass-approvals-and-sandbox",
+            "image_files": {},
+            "extra_launchers": (),
+            "build_args": lambda self: {},
+            "install_cmds": (
+                "printf '#!/bin/sh\\nexit 0\\n' > /tmp/pinned-codex "
+                "&& chmod 0755 /tmp/pinned-codex "
+                "&& ln /tmp/pinned-codex /usr/local/bin/codex",
+            ),
+        },
+    )()
+    (work / "Dockerfile").write_text(
+        DockerImageBuilder(None)._work_dockerfile(
+            agent=agent,  # type: ignore[arg-type]
+            base_ref=base_tag,
+            workdir=PurePosixPath("/workspace"),
+            final_user="0",
+        )
+    )
+    (work / "rsi-submit").write_text("#!/bin/sh\nexit 0\n")
+
+    try:
+        base_build = subprocess.run(
+            ["docker", "build", "-q", "-t", base_tag, "."],
+            cwd=base,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=60,
+        )
+        assert base_build.returncode == 0, base_build.stdout + base_build.stderr
+
+        work_build = subprocess.run(
+            ["docker", "build", "-q", "-t", work_tag, "."],
+            cwd=work,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=120,
+        )
+        assert work_build.returncode == 0, work_build.stdout + work_build.stderr
+
+        execution = subprocess.run(
+            ["docker", "run", "--rm", "--network", "none", work_tag, "codex"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+        assert execution.returncode == 0, execution.stdout + execution.stderr
+    finally:
+        subprocess.run(
+            ["docker", "image", "rm", "-f", work_tag, base_tag],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("effective_user", "expected_uid", "expected_gid"),
+    [
+        ("1001", "1001", "1001"),
+        ("nobody", "65534", "65534"),
+        ("2001:2002", "2001", "2002"),
+        ("nobody:nogroup", "65534", "65534"),
+    ],
+)
+def test_agent_identity_alias_matches_effective_user_in_real_container(
+    effective_user,
+    expected_uid,
+    expected_gid,
+):
+    probe = subprocess.run(
+        ["docker", "image", "inspect", "ubuntu:24.04"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip(f"local ubuntu Docker image capability unavailable: {probe.stderr}")
+    script = build_agent_identity_script(effective_user)
+    script += (
+        f'\ntest "$(id -u agent)" = "{expected_uid}"'
+        f'\ntest "$(id -g agent)" = "{expected_gid}"'
+        '\ntest "$(stat -c %u /home/agent)" = "$(id -u agent)"\n'
+        'test "$(stat -c %g /home/agent)" = "$(id -g agent)"\n'
+    )
+
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "ubuntu:24.04",
+            "/bin/bash",
+            "-lc",
+            script,
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.integration
+def test_agent_identity_repairs_preexisting_agent_group_to_effective_gid():
+    probe = subprocess.run(
+        ["docker", "image", "inspect", "ubuntu:24.04"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip(f"local ubuntu Docker image capability unavailable: {probe.stderr}")
+    script = "groupadd -g 1234 agent\n" + build_agent_identity_script("1001")
+    script += '\ntest "$(id -g agent)" = "1001"\n'
+
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "ubuntu:24.04",
+            "/bin/bash",
+            "-lc",
+            script,
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def _model_access(task):
+    return task.model_copy(
+        update={"verifier": task.verifier.model_copy(update={"model_access": True})}
+    )
+
+
+def test_model_access_preflights_python_and_a_free_agent_uid(tmp_path) -> None:
+    client = FakeDockerClient()
+    task = _model_access(task_definition(tmp_path))
+
+    plan = DockerImageBuilder(client).prepare(
+        task, agent=create_agent("codex", RSILoopConfig())
+    )
+
+    work, judge, agent = client.containers.runs
+    assert agent["image"] == plan.work_ref
+    assert agent["user"] == "0" and agent["network_mode"] == "none"
+    assert "command -v python3" in agent["command"][2]
+    assert "python3 -I -S -B" in agent["command"][2]
+    check = agent["command"][4]
+    assert "sys.version_info < (3, 8)" in check
+    assert "ids = range(61000, 61016)" in check
+    assert "grp.getgrall()" in check and "pwd.getpwall()" in check
+    assert "import ctypes, fcntl" in check
+    assert agent["remove"] is True
+
+
+def test_model_access_without_python_fails_setup_clearly(tmp_path) -> None:
+    client = FakeDockerClient()
+    task = _model_access(task_definition(tmp_path))
+
+    def run_hook(image, command, **kwargs):
+        if "rsi-agent-preflight" in command:
+            raise RuntimeError("python3 is missing")
+        return b""
+
+    client.containers.run_hook = run_hook
+
+    with pytest.raises(SetupError, match="python3 3.8 or later.*python3 is missing"):
+        DockerImageBuilder(client).prepare(
+            task, agent=create_agent("codex", RSILoopConfig())
+        )
+
+
+def test_without_model_access_no_rsi_agent_preflight_runs(tmp_path) -> None:
+    client = FakeDockerClient()
+
+    DockerImageBuilder(client).prepare(
+        task_definition(tmp_path), agent=create_agent("codex", RSILoopConfig())
+    )
+
+    assert len(client.containers.runs) == 2
+
+
+def test_work_image_finds_agent_launchers_on_the_path_the_agent_gets(
+    tmp_path: Path,
+) -> None:
+    """The launcher quarantine and the installed launcher check resolve it
+    outside a login shell, like the Agent's exec: a login profile that
+    resets PATH would miss a task copy that shadows the pinned CLI."""
+    client = FakeDockerClient()
+
+    DockerImageBuilder(client).prepare(
+        task_definition(tmp_path), agent=create_agent("codex", RSILoopConfig())
+    )
+
+    lines = client.images.built[-1]["context_files"]["Dockerfile"].splitlines()
+    steps = [
+        json.loads(line.removeprefix("RUN "))
+        for line in lines
+        if line.startswith("RUN [") and "launcher=" in line
+    ]
+    assert len(steps) == 3
+    assert "original-launchers" in steps[0][2]
+    assert steps[1][2] == images_module._pin_node_launcher_script("codex")
+    assert "command -v codex" in steps[2][2]
+    assert [step[:2] for step in steps] == [list(AGENT_SHELL)] * 3
+    # The npm launcher is pinned to node after the install and before the check.
+    install = next(i for i, line in enumerate(lines) if "npm install -g" in line)
+    pin, check = (lines.index("RUN " + json.dumps(step)) for step in steps[1:])
+    assert install < pin < check
+
+
+def _run_pin_script(tmp_path: Path, launcher: str) -> subprocess.CompletedProcess:
+    """Run the pin step against tmp_path/bin, with a fake pinned node."""
+    node = tmp_path / "pinned-node"
+    node.write_text('#!/bin/bash\necho "pinned-node $*"\n')
+    node.chmod(0o755)
+    script = images_module._pin_node_launcher_script(launcher).replace(
+        images_module.NODE_BIN, str(node)
+    )
+    return subprocess.run(
+        [*AGENT_SHELL, script],
+        env={"PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_npm_launcher_is_pinned_to_the_installed_node(tmp_path: Path) -> None:
+    """A `#!/usr/bin/env node` launcher would run on a task image's node
+    ahead of /usr/local/bin; its script's shebang names the pinned one."""
+    package = tmp_path / "lib" / "node_modules" / "@scope" / "cli"
+    package.mkdir(parents=True)
+    script = package / "cli.js"
+    script.write_text("#!/usr/bin/env node\nconsole.log(1)\n")
+    script.chmod(0o755)
+    (tmp_path / "bin").mkdir()
+    launcher = tmp_path / "bin" / "tool"
+    launcher.symlink_to(script)
+
+    result = _run_pin_script(tmp_path, "tool")
+
+    assert result.returncode == 0, result.stderr
+    # Still a symlink to the script, which `node <launcher>` can load.
+    assert launcher.resolve() == script
+    node = tmp_path / "pinned-node"
+    assert script.read_text() == f"#!{node}\nconsole.log(1)\n"
+    ran = subprocess.run(
+        [str(launcher), "a b", "c"], capture_output=True, text=True, check=True
+    )
+    assert ran.stdout == f"pinned-node {launcher} a b c\n"
+    # A second launcher of the same script finds it already pinned.
+    assert _run_pin_script(tmp_path, "tool").returncode == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"#!/bin/sh\nexec /usr/local/bin/node /opt/x.mjs\n", b"\x7fELF\x00node\n"],
+)
+def test_pin_step_leaves_shell_and_native_launchers_alone(
+    tmp_path: Path, content: bytes
+) -> None:
+    (tmp_path / "bin").mkdir()
+    launcher = tmp_path / "bin" / "tool"
+    launcher.write_bytes(content)
+    launcher.chmod(0o755)
+
+    result = _run_pin_script(tmp_path, "tool")
+
+    assert result.returncode == 0, result.stderr
+    assert launcher.read_bytes() == content
+
+
+def test_pin_step_refuses_a_node_shebang_it_cannot_wrap(tmp_path: Path) -> None:
+    (tmp_path / "bin").mkdir()
+    launcher = tmp_path / "bin" / "tool"
+    launcher.write_text("#!/usr/bin/env -S node --no-warnings\n")
+    launcher.chmod(0o755)
+
+    result = _run_pin_script(tmp_path, "tool")
+
+    assert result.returncode == 86
+    assert "unexpected node launcher shebang" in result.stderr
+
+
+def _driver_resource(name: str) -> str:
+    return (
+        resources.files("rsi_loop")
+        .joinpath("harness", "agent", "driver", name)
+        .read_text()
+    )
+
+
+def test_driven_work_image_bakes_driver_files_before_install_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    register_fake_driven_agent(monkeypatch)
+    client = FakeDockerClient()
+    task = task_definition(tmp_path)
+    task = task.model_copy(
+        update={"agent": task.agent.model_copy(update={"name": "fake-driven"})}
+    )
+
+    DockerImageBuilder(client).prepare(
+        task, agent=create_agent("fake-driven", RSILoopConfig())
+    )
+
+    work_build = client.images.built[-1]
+    files = work_build["context_files"]
+    assert set(files) == {"Dockerfile", "rsi-submit", "agent-files/0", "agent-files/1"}
+    assert files["agent-files/0"] == _driver_resource("rsi-agent-driver.mjs")
+    assert files["agent-files/1"] == _driver_resource("rsi-agent-driver.sh")
+    lines = files["Dockerfile"].splitlines()
+    quarantines = [i for i, line in enumerate(lines) if "original-launchers" in line]
+    quarantine = quarantines[-1]
+    copies = [
+        i for i, line in enumerate(lines) if line.startswith('COPY ["agent-files/')
+    ]
+    assert [lines[i] for i in copies] == [
+        'COPY ["agent-files/0", "/opt/rsi-harness/agent-driver.mjs"]',
+        'COPY ["agent-files/1", "/usr/local/bin/rsi-agent-driver"]',
+    ]
+    chmod = copies[-1] + 1
+    assert "chmod 0644 /opt/rsi-harness/agent-driver.mjs" in lines[chmod]
+    assert "chmod 0755 /usr/local/bin/rsi-agent-driver" in lines[chmod]
+    node = next(
+        i for i, line in enumerate(lines) if f"node-v{versions.NODE_VERSION}" in line
+    )
+    cli = next(i for i, line in enumerate(lines) if "fake-cli@1.2.3" in line)
+    pins = [i for i, line in enumerate(lines) if "readlink -f" in line]
+    checks = [i for i, line in enumerate(lines) if 'test -x \\"$launcher\\"' in line]
+    assert quarantine < copies[0] < chmod < node < cli < pins[0]
+    assert pins[-1] < checks[0]
+    assert "command -v rsi-agent-driver" in lines[pins[0]]
+    assert "command -v fake-cli" in lines[pins[1]]
+    # The CLI the driver starts is moved aside and checked like the driver.
+    assert ["launcher=rsi-agent-driver" in lines[i] for i in quarantines] == [
+        True,
+        False,
+    ]
+    assert "launcher=fake-cli" in lines[quarantines[1]]
+    assert ["command -v rsi-agent-driver" in lines[i] for i in checks] == [True, False]
+    assert "command -v fake-cli" in lines[checks[1]]
+
+
+class _MirroredAgent(FakeDrivenAgent):
+    install_cmds = [
+        *DrivenAgent.install_cmds,
+        'curl -fsSL "${FAKE_MIRROR:-https://example.invalid}/fake-cli.tgz"',
+    ]
+    mirror: str | None = None
+
+    def build_args(self) -> dict[str, str | None]:
+        return {"FAKE_MIRROR": self.mirror}
+
+
+def test_build_args_reach_install_commands_without_changing_the_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = task_definition(tmp_path)
+    task = task.model_copy(
+        update={"agent": task.agent.model_copy(update={"name": "fake-driven"})}
+    )
+    builds = []
+    for mirror in (None, "https://mirror.test"):
+        agent = type("Mirrored", (_MirroredAgent,), {"mirror": mirror})
+        monkeypatch.setitem(agent_factory._REGISTRY, "fake-driven", agent)
+        client = FakeDockerClient()
+        DockerImageBuilder(client).prepare(
+            task, agent=create_agent("fake-driven", RSILoopConfig())
+        )
+        builds.append(client.images.built[-1])
+
+    unset, mirrored = builds
+    lines = mirrored["context_files"]["Dockerfile"].splitlines()
+    # Declared before the command that reads it.
+    declared = lines.index("ARG FAKE_MIRROR")
+    reader = next(i for i, line in enumerate(lines) if "FAKE_MIRROR:-" in line)
+    assert declared < reader
+    assert unset["buildargs"] == {}
+    assert mirrored["buildargs"] == {"FAKE_MIRROR": "https://mirror.test"}
+    # Declared either way, so one tag: the value only picks where the
+    # install commands fetch from.
+    assert (
+        unset["context_files"]["Dockerfile"] == mirrored["context_files"]["Dockerfile"]
+    )
+    assert unset["tag"] == mirrored["tag"]
+
+
+def test_unsafe_build_arg_name_is_refused() -> None:
+    class BadArg(FakeDrivenAgent):
+        def build_args(self) -> dict[str, str | None]:
+            return {"A B": None}
+
+    with pytest.raises(SetupError, match="build argument is unsafe"):
+        DockerImageBuilder(None)._work_dockerfile(
+            agent=BadArg(RSILoopConfig()),
+            base_ref="ubuntu:24.04",
+            workdir=PurePosixPath("/workspace"),
+            final_user="1001",
+        )
+
+
+def test_unsafe_extra_launcher_is_refused() -> None:
+    class BadLauncher(FakeDrivenAgent):
+        extra_launchers = ("/usr/bin/fake-cli",)
+
+    with pytest.raises(SetupError, match="extra launcher is unsafe"):
+        DockerImageBuilder(None)._work_dockerfile(
+            agent=BadLauncher(RSILoopConfig()),
+            base_ref="ubuntu:24.04",
+            workdir=PurePosixPath("/workspace"),
+            final_user="1001",
+        )
+
+
+def test_work_tag_hashes_image_file_contents_only_for_agents_that_have_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[dict[str, object]] = []
+    original_dumps = images_module.json.dumps
+
+    def capture(value: object, *args: object, **kwargs: object) -> str:
+        if isinstance(value, dict) and "base_digest" in value:
+            captured.append(value)
+        return original_dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(images_module.json, "dumps", capture)
+    builder = DockerImageBuilder(None)
+    arguments = {
+        "base_digest": "sha256:base",
+        "effective_user": "1001",
+        "workdir": PurePosixPath("/workspace"),
+        "dockerfile": "FROM base",
+        "submit_client": "client",
+    }
+    task = task_definition(tmp_path)
+    builder._work_tag(task, create_agent("codex", RSILoopConfig()), **arguments)
+    driven_tag = builder._work_tag(task, FakeDrivenAgent(RSILoopConfig()), **arguments)
+
+    class OtherDriver(FakeDrivenAgent):
+        image_files = {
+            "/opt/rsi-harness/agent-driver.mjs": (
+                "harness/agent/driver/rsi-agent-driver.sh",
+                0o644,
+            ),
+            "/usr/local/bin/rsi-agent-driver": (
+                "harness/agent/driver/rsi-agent-driver.sh",
+                0o755,
+            ),
+        }
+
+    other_tag = builder._work_tag(task, OtherDriver(RSILoopConfig()), **arguments)
+
+    codex_identity, driven_identity, _other_identity = captured
+    assert "image_files" not in codex_identity
+    assert driven_identity["image_files"] == {
+        "/opt/rsi-harness/agent-driver.mjs": hashlib.sha256(
+            _driver_resource("rsi-agent-driver.mjs").encode()
+        ).hexdigest(),
+        "/usr/local/bin/rsi-agent-driver": hashlib.sha256(
+            _driver_resource("rsi-agent-driver.sh").encode()
+        ).hexdigest(),
+    }
+    assert other_tag != driven_tag
+
+
+@pytest.mark.parametrize(
+    ("image_files", "message"),
+    [
+        ({"relative/file": ("harness/agent/driven.py", 0o644)}, "path is unsafe"),
+        ({"/opt/../etc/passwd": ("harness/agent/driven.py", 0o644)}, "path is unsafe"),
+        ({"/opt/a b": ("harness/agent/driven.py", 0o644)}, "path is unsafe"),
+        ({"/opt/f": ("../rsi_harness/cli.py", 0o644)}, "source is unsafe"),
+        ({"/opt/f": ("harness/agent/missing.mjs", 0o644)}, "missing from the"),
+        ({"/opt/f": ("harness/agent/driven.py", 0o4755)}, "mode is invalid"),
+    ],
+)
+def test_unsafe_or_missing_image_files_are_refused(image_files, message) -> None:
+    class BadFiles(FakeDrivenAgent):
+        pass
+
+    BadFiles.image_files = image_files
+
+    with pytest.raises(SetupError, match=message):
+        DockerImageBuilder(None)._work_dockerfile(
+            agent=BadFiles(RSILoopConfig()),
+            base_ref="ubuntu:24.04",
+            workdir=PurePosixPath("/workspace"),
+            final_user="1001",
+        )
+
+
+# -- the Judge LLM's Codex CLI ------------------------------------------------
+
+CODEX_PATH = (
+    "/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64"
+    "/vendor/x86_64-unknown-linux-musl/bin/codex"
+)
+
+
+@pytest.fixture(autouse=True)
+def _pinned_codex(monkeypatch):
+    """Pin the fake binaries below, as versions.py pins the real release."""
+    import hashlib
+
+    monkeypatch.setattr(
+        versions,
+        "CODEX_SHA256_X86_64",
+        hashlib.sha256(b"\x7fELF-native-codex").hexdigest(),
+    )
+    monkeypatch.setattr(
+        versions, "CODEX_SHA256_AARCH64", hashlib.sha256(b"native").hexdigest()
+    )
+
+
+def _codex_archive(*members: tuple[str, bytes]) -> bytes:
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as bundle:
+        for name, content in members:
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            bundle.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def _codex_client(archive: bytes, architecture: str = "amd64"):
+    client = FakeDockerClient()
+    archived = []
+
+    def run_hook(image, command, **kwargs):
+        if "npm root -g" in command[2]:
+            assert kwargs["network_mode"] == "none" and kwargs["user"] == "0"
+            return CODEX_PATH.encode()
+        return b""
+
+    client.containers.run_hook = run_hook
+    create = client.containers.create
+
+    def create_with_archive(image, command, **kwargs):
+        container = create(image, command, **kwargs)
+
+        def get_archive(path):
+            archived.append((image, path))
+            return iter((archive[:100], archive[100:])), {}
+
+        container.get_archive = get_archive
+        return container
+
+    client.containers.create = create_with_archive
+    return client, archived, architecture
+
+
+def _prepare_codex(tmp_path, client, architecture, agent_name="codex"):
+    task = task_definition(tmp_path)
+    task = task.model_copy(
+        update={"agent": task.agent.model_copy(update={"name": agent_name})}
+    )
+    agent = create_agent(agent_name, RSILoopConfig())
+    builder = DockerImageBuilder(client)
+    plan = builder.prepare(task, agent=agent)
+    base = next(
+        image for image in client.images.by_ref.values() if image.id == plan.base_ref
+    )
+    base.attrs["Architecture"] = architecture
+    client.images.by_ref[plan.base_ref] = base
+    cache = tmp_path / "data" / "judge-codex"
+    return builder, task, plan, agent, cache
+
+
+def test_judge_codex_cli_is_copied_from_the_codex_work_image(tmp_path) -> None:
+    client, archived, architecture = _codex_client(
+        _codex_archive(("codex", b"\x7fELF-native-codex"))
+    )
+    builder, task, plan, agent, cache = _prepare_codex(tmp_path, client, architecture)
+
+    directory = builder.prepare_judge_codex(
+        task, images=plan, work_agent=agent, cache_root=cache
+    )
+
+    assert directory == cache / f"codex-{versions.CODEX}-x86_64"
+    binary = directory / "codex"
+    assert binary.read_bytes() == b"\x7fELF-native-codex"
+    assert binary.stat().st_mode & 0o777 == 0o755
+    assert sorted(path.name for path in directory.iterdir()) == ["codex"]
+    # The run's own Codex Work image; the pinned version, checked in it.
+    assert archived == [(plan.work_ref, CODEX_PATH)]
+    finder = client.containers.runs[-1]
+    assert finder["image"] == plan.work_ref
+    assert f'"codex-cli {versions.CODEX}"' in finder["command"][2]
+    assert len(client.images.built) == 2
+    copier = client.containers.created[-1]
+    assert copier["command"] == ["/bin/true"] and copier["network_mode"] == "none"
+    last = list(client.containers.by_id.values())[-1]
+    assert last.removed_kwargs == {"force": True}
+
+    runs = len(client.containers.runs)
+    assert (
+        builder.prepare_judge_codex(
+            task, images=plan, work_agent=agent, cache_root=cache
+        )
+        == directory
+    )
+    assert len(client.containers.runs) == runs
+
+
+def test_judge_codex_cli_for_another_agent_builds_the_codex_image(tmp_path) -> None:
+    client, archived, architecture = _codex_client(
+        _codex_archive(("codex", b"native")), "arm64"
+    )
+    builder, task, plan, agent, cache = _prepare_codex(
+        tmp_path, client, architecture, agent_name="claude-code"
+    )
+
+    directory = builder.prepare_judge_codex(
+        task, images=plan, work_agent=agent, cache_root=cache
+    )
+
+    assert directory.name == f"codex-{versions.CODEX}-aarch64"
+    # A third build: the task's Codex Work image, never the run's Work image.
+    assert len(client.images.built) == 3
+    dockerfile = client.images.built[-1]["context_files"]["Dockerfile"]
+    assert f"npm install -g @openai/codex@{versions.CODEX}" in dockerfile
+    assert f"FROM {plan.base_ref}" in dockerfile
+    assert archived[0][0] != plan.work_ref
+
+
+def test_judge_codex_cli_bytes_must_be_the_pinned_release(tmp_path) -> None:
+    # A task's image may hold any binary that prints the right version.
+    client, _, architecture = _codex_client(
+        _codex_archive(("codex", b"\x7fELF-planted-by-a-task"))
+    )
+    builder, task, plan, agent, cache = _prepare_codex(tmp_path, client, architecture)
+
+    with pytest.raises(SetupError, match="not the pinned"):
+        builder.prepare_judge_codex(
+            task, images=plan, work_agent=agent, cache_root=cache
+        )
+    assert not (cache / f"codex-{versions.CODEX}-x86_64" / "codex").exists()
+
+
+def test_judge_codex_cli_cache_is_checked_on_every_use(tmp_path) -> None:
+    client, archived, architecture = _codex_client(
+        _codex_archive(("codex", b"\x7fELF-native-codex"))
+    )
+    builder, task, plan, agent, cache = _prepare_codex(tmp_path, client, architecture)
+    # An earlier run's cache, changed since (or planted): never trusted.
+    planted = cache / f"codex-{versions.CODEX}-x86_64" / "codex"
+    planted.parent.mkdir(parents=True)
+    planted.write_bytes(b"\x7fELF-planted")
+    planted.chmod(0o755)
+
+    directory = builder.prepare_judge_codex(
+        task, images=plan, work_agent=agent, cache_root=cache
+    )
+
+    assert (directory / "codex").read_bytes() == b"\x7fELF-native-codex"
+    assert len(archived) == 1
+
+
+@pytest.mark.parametrize(
+    ("archive", "architecture", "message"),
+    [
+        (_codex_archive(("codex", b"x")), "s390x", "no release for s390x"),
+        (
+            _codex_archive(("codex", b"x"), ("other", b"y")),
+            "amd64",
+            "not one file",
+        ),
+    ],
+)
+def test_judge_codex_cli_failures_are_setup_errors(
+    tmp_path, archive, architecture, message
+) -> None:
+    client, _, architecture = _codex_client(archive, architecture)
+    builder, task, plan, agent, cache = _prepare_codex(tmp_path, client, architecture)
+
+    with pytest.raises(SetupError, match=message):
+        builder.prepare_judge_codex(
+            task, images=plan, work_agent=agent, cache_root=cache
+        )
+    assert not (cache / f"codex-{versions.CODEX}-x86_64" / "codex").exists()
+
+
+def test_judge_model_preflights_python_and_a_free_agent_uid(tmp_path) -> None:
+    client = FakeDockerClient()
+    task = task_definition(tmp_path)
+    task = task.model_copy(
+        update={
+            "verifier": task.verifier.model_copy(
+                update={"judge_model": "gpt-judge", "judge_model_effort": "medium"}
+            )
+        }
+    )
+
+    DockerImageBuilder(client).prepare(
+        task, agent=create_agent("codex", RSILoopConfig())
+    )
+
+    assert any(
+        "rsi-agent-preflight" in run["command"] for run in client.containers.runs
+    )
+
+
+def test_oracle_work_image_adds_only_its_launcher(tmp_path: Path) -> None:
+    """No CLI or node: the task image, the Work layer and rsi-oracle."""
+    task = task_definition(tmp_path)
+    task = task.model_copy(
+        update={"agent": task.agent.model_copy(update={"name": "oracle"})}
+    )
+    oracle = create_agent("oracle", RSILoopConfig())
+    client = FakeDockerClient()
+
+    DockerImageBuilder(client).prepare(task, agent=oracle)
+
+    work = client.images.built[-1]
+    dockerfile = work["context_files"]["Dockerfile"]
+    launcher = resources.files("rsi_loop").joinpath("harness/agent/oracle/rsi-oracle")
+    staged = [
+        content
+        for name, content in work["context_files"].items()
+        if name.startswith("agent-files/")
+    ]
+    assert staged == [launcher.read_text()]
+    assert "/usr/local/bin/rsi-oracle" in dockerfile
+    assert "chmod 0755 /usr/local/bin/rsi-oracle" in dockerfile
+    assert "command -v rsi-oracle" in dockerfile
+    assert "npm install" not in dockerfile
+    assert "node-v" not in dockerfile
+    assert work["tag"].startswith("rsi-harness-work:environment-digest-abcdef-oracle-")
+    # The tag is stable and the other Agents' tags do not move.
+    again = FakeDockerClient()
+    DockerImageBuilder(again).prepare(task, agent=oracle)
+    assert again.images.built[-1]["tag"] == work["tag"]
+    codex_task = task.model_copy(
+        update={"agent": task.agent.model_copy(update={"name": "codex"})}
+    )
+    codex = FakeDockerClient()
+    DockerImageBuilder(codex).prepare(
+        codex_task, agent=create_agent("codex", RSILoopConfig())
+    )
+    assert "rsi-oracle" not in codex.images.built[-1]["context_files"]["Dockerfile"]

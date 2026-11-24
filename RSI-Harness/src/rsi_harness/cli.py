@@ -1,0 +1,1300 @@
+"""Command-line entry points for production RSI Harness runs."""
+
+from __future__ import annotations
+
+import json
+import re
+import shlex
+import signal
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol
+
+import typer
+from pydantic import ValidationError
+
+from rsi_harness.cluster.base import ClusterRunRequest, ClusterRunResult
+from rsi_harness.cluster.bluevela.adapter import build_cluster_adapter
+from rsi_harness.config import EngineConfig
+from rsi_harness.errors import HarnessError, SetupError
+from rsi_harness.models import (
+    AgentAuthSource,
+    CompileOptions,
+    JudgeLLMAuth,
+    JudgeLLMRequest,
+    RunGPUPlan,
+    RunPaths,
+    RunRequest,
+    RunResult,
+    RunStatus,
+)
+from rsi_harness.runtime.oracle import oracle_failures as _oracle_failures
+from rsi_harness.runtime.redaction import redact_text
+from rsi_harness.runtime.sandbox_contracts import REMOTE_BACKENDS
+from rsi_harness.runtime.sandbox_policy import load_sandbox_policy
+from rsi_loop.harness.agent import get_agent_class
+
+if TYPE_CHECKING:
+    from rsi_harness.runtime.recovery import AttemptGrants
+    from rsi_harness.runtime.resume import ResumeContext
+
+    # The ledger imports the docker SDK: loaded only by prune-images.
+    from rsi_harness.runtime.sandbox_ledger import PruneRow
+
+app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
+sandbox_app = typer.Typer(
+    no_args_is_help=True,
+    pretty_exceptions_enable=False,
+    help="Operator commands for managed sandboxes.",
+)
+app.add_typer(sandbox_app, name="sandbox")
+
+
+class RuntimeServicesPort(Protocol):
+    def available_agents(self) -> tuple[str, ...]: ...
+
+    def run(self, request: RunRequest) -> RunResult: ...
+
+    def recover(self, run_id: str | None) -> tuple[str, ...]: ...
+
+    def cleanup(self, run_id: str, *, delete_workspace: bool) -> None: ...
+
+    def plan_resume(
+        self, run_id: str, grants: AttemptGrants, *, dry_run: bool = False
+    ) -> ResumeContext: ...
+
+    def resume(self, context: ResumeContext) -> RunResult: ...
+
+    def prune_images(
+        self,
+        *,
+        older_than_seconds: float | None,
+        dry_run: bool,
+        confirm: Callable[[tuple[PruneRow, ...]], bool],
+    ) -> tuple[PruneRow, ...] | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeRoots:
+    data: Path
+    logs: Path
+
+
+def build_runtime_services(
+    *,
+    roots: RuntimeRoots,
+    event_callback: Callable[[str, object], None] | None = None,
+    engine_config: EngineConfig | None = None,
+) -> RuntimeServicesPort:
+    """Build the concrete Docker/NVIDIA/RSI Loop production runtime."""
+    from rsi_harness.runtime.production import ProductionRuntimeServices
+
+    return ProductionRuntimeServices(
+        data_root=roots.data,
+        logs_root=roots.logs,
+        event_callback=event_callback,
+        engine_config=engine_config,
+    )
+
+
+def _selectors(value: str) -> tuple[str, ...]:
+    raw = value.split(",")
+    selectors = tuple(item.strip() for item in raw)
+    if not selectors or any(not item for item in selectors):
+        raise typer.BadParameter("GPU selector list contains an empty value")
+    if len(selectors) != len(set(selectors)):
+        raise typer.BadParameter("GPU selector list contains a duplicate value")
+    return selectors
+
+
+def _services(
+    data_root: Path,
+    logs_root: Path,
+    *,
+    event_callback: Callable[[str, object], None] | None = None,
+    engine_config: EngineConfig | None = None,
+) -> RuntimeServicesPort:
+    roots = RuntimeRoots(
+        data=data_root.expanduser().resolve(),
+        logs=logs_root.expanduser().resolve(),
+    )
+    if engine_config is not None:
+        return build_runtime_services(
+            roots=roots,
+            event_callback=event_callback,
+            engine_config=engine_config,
+        )
+    if event_callback is None:
+        return build_runtime_services(roots=roots)
+    return build_runtime_services(roots=roots, event_callback=event_callback)
+
+
+@dataclass(frozen=True, slots=True)
+class _RunConsole:
+    def __call__(self, name: str, value: object) -> None:
+        if name == "gpu_plan" and isinstance(value, RunGPUPlan):
+            typer.echo(f"GPU pool: {','.join(value.authorized_pool.uuids)}")
+            typer.echo(f"Work GPUs: {','.join(value.work.uuids)}")
+            judge = ",".join(value.judge.uuids) or "none"
+            typer.echo(f"Judge GPUs: {judge}")
+            typer.echo(f"Judge GPU mode: {value.judge_mode.value}")
+            typer.echo(
+                "Preparing task images (the first run may take several minutes)..."
+            )
+        elif name == "sandbox_reserved" and isinstance(value, Mapping):
+            typer.echo(
+                f"Sandbox envelope: {value['cpus']} CPUs, {value['memory_mb']} MiB "
+                "(parents + children + broker)"
+            )
+        elif name == "docker_memory_limit_unsupported":
+            typer.echo(
+                "Warning: Docker does not report memory limit support (MemoryLimit), "
+                f"so the task's {value} MiB limit is not enforced; Work and the Judge "
+                "run without it. Check `docker info` and, for rootless Docker, "
+                "cgroup controller delegation."
+            )
+        elif name == "judge_clean_image_unavailable":
+            typer.echo(
+                f"Warning: {value}, so every Judge runs from a snapshot of Work, "
+                "with all the Agent's changes, instead of the clean Work image "
+                "(set clean_image = false to accept this)."
+            )
+        elif name == "judge_llm" and isinstance(value, Mapping):
+            source = (
+                "the Work Agent's credential"
+                if value.get("reused")
+                else f"--judge-llm-auth {value.get('credential')}"
+            )
+            expires = value.get("expires_at")
+            until = (
+                ""
+                if not isinstance(expires, (int, float))
+                else "; its login's access token expires "
+                + time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(expires))
+                + " and is refreshed in place before a Judge round would outlive it"
+            )
+            typer.echo(
+                f"Judge LLM: {value.get('model')} (effort {value.get('effort')}) "
+                f"via {source}{until}"
+            )
+        elif name == "judge_login_kept" and isinstance(value, Mapping):
+            typer.echo(
+                f"Warning: Judge {value.get('round_id')}: the Work Agent's current "
+                f"login was not used ({value.get('reason')}); the Judge keeps its "
+                "last good copy, which stops working when its access token expires."
+            )
+        elif name == "judge_login_refresh_failed" and isinstance(value, Mapping):
+            typer.echo(
+                f"Warning: Judge {value.get('round_id')}: the Judge LLM's Codex "
+                f"login was not kept fresh ({value.get('reason')}); the Judge "
+                "refuses calls its access token would not outlive."
+            )
+        elif name == "judge_llm_ignored":
+            typer.echo(
+                "Warning: the task declares no judge_model; the --judge-llm-* "
+                "options are ignored."
+            )
+        elif (
+            name == "network_policy"
+            and isinstance(value, Mapping)
+            and value.get("backend") == "container-namespace"
+        ):
+            typer.echo(
+                "Network policy: enforced in each container's own namespace "
+                "(non-root controller)"
+            )
+        elif name == "images_ready":
+            typer.echo("Task images ready; preparing Work container...")
+        elif name == "run_started" and isinstance(value, str):
+            typer.echo(f"Run ID: {value}")
+        elif name == "work_started":
+            typer.echo("Work container started; preparing Agent...")
+        elif name == "agent_started":
+            details = value if isinstance(value, Mapping) else {}
+            agent = details.get("name", "Agent")
+            timeout = details.get("timeout_seconds")
+            suffix = "" if timeout is None else f" (timeout={timeout}s)"
+            typer.echo(f"Running {agent}{suffix}...")
+            output_path = details.get("output_path")
+            if output_path is not None:
+                typer.echo(f"Agent output: {output_path}")
+        elif name == "agent_finished":
+            details = value if isinstance(value, Mapping) else {}
+            typer.echo(
+                "Agent finished: "
+                f"exit_code={details.get('exit_code')} "
+                f"timed_out={details.get('timed_out', False)}"
+            )
+            if details.get("stopped_by"):
+                typer.echo(
+                    f"Agent stopped: {details['stopped_by']}; resume the run "
+                    "once the provider recovers"
+                )
+        elif name == "final_judge_planned":
+            typer.echo(
+                "Final judge: submission budget 1; the Agent's one rsi-submit, "
+                "else the Harness when its time ends, judges the WORKDIR once"
+            )
+        elif name == "agent_ended_early":
+            typer.echo(f"Attempt not judged: {value}")
+        elif name == "agent_ended_after_final_judge":
+            typer.echo("Agent ended by the Harness after its one final judge")
+        elif name == "final_judge_started":
+            typer.echo("Work stopped; the final judge evaluates the WORKDIR")
+        elif name == "judge_started":
+            round_id = self._round_id(value)
+            typer.echo(f"Judge {round_id}: snapshotting Work...")
+        elif name == "judge_exec_started":
+            round_id = self._round_id(value)
+            typer.echo(f"Judge {round_id}: running /tests/test.sh...")
+        elif name == "judge_finished":
+            details = value if isinstance(value, Mapping) else {}
+            score = details.get("score")
+            runtime = details.get("runtime_seconds")
+            runtime_seconds = 0.0 if runtime is None else float(runtime)
+            typer.echo(
+                f"Judge {details.get('round_id', 'unknown')} finished: "
+                f"{details.get('status', 'unknown')} "
+                f"score={'-' if score is None else score} "
+                f"runtime={runtime_seconds:.2f}s"
+            )
+
+    @staticmethod
+    def _round_id(value: object) -> object:
+        return (
+            value.get("round_id", "unknown")
+            if isinstance(value, Mapping)
+            else "unknown"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ClusterConsole:
+    def __call__(self, name: str, value: object) -> None:
+        details = value if isinstance(value, Mapping) else {}
+        if name == "dry_run":
+            resources = details.get("resources", {})
+            resources = resources if isinstance(resources, Mapping) else {}
+            multi_node = details.get("multi_node", {})
+            multi_node = multi_node if isinstance(multi_node, Mapping) else {}
+            label = {
+                "slurm": "Slurm",
+                "kubernetes": "Kubernetes",
+                "pbs": "PBS",
+                "pjm": "PJM",
+            }.get(str(details.get("adapter")), "Blue Vela")
+            typer.echo(f"{label} dry-run:")
+            typer.echo(_field("Run ID:", details.get("run_id")))
+            typer.echo(_field("Run dir:", details.get("run_dir")))
+            typer.echo(_field("Image:", details.get("image")))
+            typer.echo(_field("Cache hit:", details.get("cache_hit")))
+            if multi_node:
+                work = multi_node.get("work", {})
+                work = work if isinstance(work, Mapping) else {}
+                verifier = multi_node.get("verifier", {})
+                verifier = verifier if isinstance(verifier, Mapping) else {}
+                typer.echo(_field("Work GPUs:", work.get("gpu_count")))
+                typer.echo(_field("Judge GPUs:", verifier.get("gpu_count")))
+                typer.echo(_field("Work nodes:", work.get("node_count")))
+                typer.echo(_field("Judge nodes:", verifier.get("node_count")))
+                typer.echo(_field("Total nodes:", multi_node.get("total_nodes")))
+                typer.echo(_field("GPUs per node:", multi_node.get("gpus_per_node")))
+                typer.echo(_field("CPU/node:", multi_node.get("cpu_slots_per_node")))
+                typer.echo(_field("Memory/node:", multi_node.get("memory_mb_per_node")))
+                typer.echo(
+                    _field(
+                        "Shared workspace:",
+                        f"{multi_node.get('shared_workspace_mb')} MiB",
+                    )
+                )
+                typer.echo(
+                    _field(
+                        "Node scratch:",
+                        f"{multi_node.get('node_tmp_mb')} MiB",
+                    )
+                )
+                typer.echo(_field("Pool policy:", details.get("pool_policy")))
+            else:
+                typer.echo(_field("Work GPUs:", resources.get("work_gpus")))
+                typer.echo(_field("Verifier GPUs:", resources.get("verifier_gpus")))
+                typer.echo(_field("Total GPUs:", resources.get("total_gpus")))
+                typer.echo(_field("CPU slots:", resources.get("cpu_slots")))
+                typer.echo(_field("Memory MB:", resources.get("memory_mb")))
+            typer.echo("Build submission:")
+            typer.echo(f"  {shlex.join(tuple(details.get('build_argv', ())))}")
+            typer.echo("Run submission:")
+            typer.echo(f"  {shlex.join(tuple(details.get('run_argv', ())))}")
+            manifests = details.get("manifests")
+            if isinstance(manifests, Mapping):
+                for stage in ("build", "run"):
+                    typer.echo(f"{stage.capitalize()} Job:")
+                    typer.echo(json.dumps(manifests.get(stage), indent=2))
+            binds = tuple(details.get("binds", ()))
+            typer.echo(_field("Binds:", ", ".join(str(item) for item in binds)))
+            assets = tuple(details.get("assets", ()))
+            if assets:
+                ready = sum(
+                    1
+                    for item in assets
+                    if isinstance(item, Mapping) and item.get("ready") is True
+                )
+                typer.echo(_field("Assets ready:", f"{ready}/{len(assets)}"))
+                for item in assets:
+                    if not isinstance(item, Mapping) or item.get("ready") is True:
+                        continue
+                    typer.echo(
+                        _field(
+                            "Missing asset:",
+                            f"{item.get('phase')}:{item.get('path')}",
+                        )
+                    )
+        elif name == "run_started":
+            typer.echo(f"Run ID: {details.get('run_id')}")
+        elif name in ("judge_llm", "judge_llm_ignored"):
+            _RunConsole()(name, value)
+        elif name == "job_submitted":
+            typer.echo(f"Submitted {details.get('stage')} job: {details.get('job_id')}")
+        elif name == "job_state":
+            typer.echo(f"{details.get('stage')} job state: {details.get('state')}")
+        elif name == "podman_installed":
+            typer.echo(f"Installed Podman for image builds: {details.get('path')}")
+        elif name == "agent_version_mismatch":
+            typer.echo(
+                f"Warning: {details.get('agent')} {details.get('version')} runs, "
+                f"not the pinned {details.get('pinned')}; RUN_INFO records both."
+            )
+
+
+def _field(label: str, value: object) -> str:
+    return f"  {label:<18}{value}"
+
+
+@contextmanager
+def _terminate_as_interrupt() -> Iterator[None]:
+    """SIGTERM or SIGHUP to the controller cancels the jobs it submitted, as
+    Ctrl-C does: the scheduler's wait, or the adapter between a submission
+    and its wait, cancels on KeyboardInterrupt. A batch scheduler ends a
+    controller job (walltime, qdel, scancel, bkill) with SIGTERM, which would
+    otherwise end Python and leave the run job, Agent and all, running. A
+    signal the controller inherited as ignored (nohup) stays ignored."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous: dict[signal.Signals, Any] = {}
+
+    def ignore(signum: int, frame: object) -> None:
+        del signum, frame
+
+    def interrupt(signum: int, frame: object) -> None:
+        del signum, frame
+        # Once: a later signal (LSF's bkill sends SIGINT then SIGTERM) must
+        # not interrupt the cancellation. A Python handler, not SIG_IGN, so
+        # the processes the cancellation starts do not inherit it.
+        for selected in previous:
+            signal.signal(selected, ignore)
+        raise KeyboardInterrupt
+
+    try:
+        for selected in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            if signal.getsignal(selected) is not signal.SIG_IGN:
+                previous[selected] = signal.signal(selected, interrupt)
+        yield
+    finally:
+        for selected, handler in previous.items():
+            signal.signal(selected, handler)
+
+
+def _fail(error: BaseException, *, verbose: bool) -> None:
+    if verbose:
+        detail = redact_text(f"{type(error).__name__}: {error}")
+    elif isinstance(error, HarnessError):
+        detail = f"{error.code.value}: {redact_text(str(error))}"
+    elif isinstance(error, KeyboardInterrupt) and str(error):
+        # What the interrupt left behind, such as a cancelled cluster job.
+        detail = redact_text(str(error))
+    else:
+        detail = "run failed; use --verbose for diagnostic detail"
+    typer.echo(f"Error: {detail}", err=True)
+    raise typer.Exit(1)
+
+
+def _runs_task_solution(agent: str) -> bool:
+    try:
+        return bool(getattr(get_agent_class(agent), "runs_task_solution", False))
+    except ValueError:
+        return False
+
+
+@app.command("run")
+def run_command(
+    task_dir: Annotated[Path, typer.Argument()],
+    agent: Annotated[str, typer.Option("--agent")] = "codex",
+    gpus: Annotated[
+        str,
+        typer.Option(
+            "--gpus",
+            help=(
+                "Ordered GPU pool authorized for this run; Work sees only its "
+                "task-declared count. Omit for CPU-only Work and Judge"
+            ),
+        ),
+    ] = "",
+    primary_reward: Annotated[str | None, typer.Option("--primary-reward")] = None,
+    score_direction: Annotated[
+        Literal["maximize", "minimize"], typer.Option("--score-direction")
+    ] = "maximize",
+    timeout: Annotated[float | None, typer.Option("--timeout", min=0.0)] = None,
+    max_submissions: Annotated[
+        int | None, typer.Option("--max-submissions", min=1)
+    ] = None,
+    cooldown: Annotated[float, typer.Option("--cooldown", min=0.0)] = 0.0,
+    data_root: Annotated[Path, typer.Option("--data-root")] = Path(".rsi-harness"),
+    logs_root: Annotated[Path, typer.Option("--logs-root")] = Path("logs"),
+    sandbox_policy: Annotated[
+        Path | None,
+        typer.Option(
+            "--sandbox-policy", help="Operator-approved local CPU sandbox policy TOML"
+        ),
+    ] = None,
+    model: Annotated[str | None, typer.Option("--model")] = None,
+    reasoning_effort: Annotated[
+        str | None,
+        typer.Option(
+            "--reasoning-effort",
+            help="Agent reasoning effort; validated by the selected Agent adapter",
+        ),
+    ] = None,
+    agent_auth: Annotated[
+        AgentAuthSource | None,
+        typer.Option("--agent-auth", help="Explicit Agent credential source"),
+    ] = None,
+    judge_llm_auth: Annotated[
+        JudgeLLMAuth | None,
+        typer.Option(
+            "--judge-llm-auth",
+            help=(
+                "Credential for a task's judge_model (rsi-agent llm): an OpenAI "
+                "API key (api) or a Codex ChatGPT login (codex-login)"
+            ),
+        ),
+    ] = None,
+    judge_llm_api_key_env: Annotated[
+        str | None,
+        typer.Option(
+            "--judge-llm-api-key-env",
+            help="Variable with the Judge LLM API key (default RSI_JUDGE_LLM_API_KEY)",
+        ),
+    ] = None,
+    judge_llm_api_key_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--judge-llm-api-key-file", help="File holding the Judge LLM API key"
+        ),
+    ] = None,
+    judge_llm_base_url: Annotated[
+        str | None,
+        typer.Option(
+            "--judge-llm-base-url",
+            help="Judge LLM API base URL (default https://api.openai.com)",
+        ),
+    ] = None,
+    judge_llm_proxy: Annotated[
+        str | None,
+        typer.Option(
+            "--judge-llm-proxy",
+            help="HTTP(S) proxy for the Judge LLM (default: the run's proxy settings)",
+        ),
+    ] = None,
+    judge_llm_codex_home: Annotated[
+        Path | None,
+        typer.Option(
+            "--judge-llm-codex-home",
+            help="Codex home holding auth.json (default $CODEX_HOME, then ~/.codex)",
+        ),
+    ] = None,
+    disable_stop_hook: Annotated[
+        bool,
+        typer.Option(
+            "--disable-stop-hook",
+            help="Allow the Agent to stop naturally without the RSI Loop stop hook",
+        ),
+    ] = False,
+    cluster: Annotated[
+        str | None,
+        typer.Option(
+            "--cluster",
+            help=(
+                "Cluster name (bluevela, slurm, sherlock, kubernetes, pbs, "
+                "flow2, flow2-node, pjm or genkai) or a "
+                "cluster profile TOML"
+            ),
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Resolve and print cluster submissions without creating or submitting",
+        ),
+    ] = False,
+    verbose: Annotated[bool, typer.Option("--verbose")] = False,
+) -> None:
+    try:
+        selectors = _selectors(gpus) if gpus else ()
+    except typer.BadParameter as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(2) from None
+
+    try:
+        task = task_dir.expanduser().resolve()
+        roots = RuntimeRoots(
+            data=data_root.expanduser().resolve(),
+            logs=logs_root.expanduser().resolve(),
+        )
+    except Exception as error:
+        _fail(
+            SetupError(f"cannot normalize run paths: {error}"),
+            verbose=verbose,
+        )
+        return
+    if not task.is_dir():
+        typer.echo(f"Error: task directory does not exist: {task}", err=True)
+        raise typer.Exit(2)
+    if cluster is not None and selectors:
+        typer.echo(
+            "Error: --gpus is local-only and cannot be used with --cluster",
+            err=True,
+        )
+        raise typer.Exit(2)
+    cluster_policy = None
+    if cluster is not None and sandbox_policy is not None:
+        try:
+            cluster_policy = load_sandbox_policy(sandbox_policy)
+        except BaseException as error:
+            _fail(error, verbose=verbose)
+            return
+        environments = cluster_policy.environments
+        if environments is None or environments.host.backend == "docker":
+            names = " or ".join(f'"{name}"' for name in REMOTE_BACKENDS)
+            typer.echo(
+                "Error: --sandbox-policy with --cluster requires "
+                f"[environments.host] backend = {names}; Docker envs are local-only",
+                err=True,
+            )
+            raise typer.Exit(2)
+    if dry_run and cluster is None:
+        typer.echo("Error: --dry-run requires --cluster", err=True)
+        raise typer.Exit(2)
+    oracle = _runs_task_solution(agent)
+    judge_llm = None
+    judge_llm_options = (
+        judge_llm_api_key_env,
+        judge_llm_api_key_file,
+        judge_llm_base_url,
+        judge_llm_proxy,
+        judge_llm_codex_home,
+    )
+    if judge_llm_auth is None and any(item is not None for item in judge_llm_options):
+        typer.echo("Error: the --judge-llm-* options need --judge-llm-auth", err=True)
+        raise typer.Exit(2)
+    if judge_llm_auth is not None:
+        try:
+            judge_llm = JudgeLLMRequest(
+                auth=judge_llm_auth,
+                api_key_env=judge_llm_api_key_env,
+                api_key_file=(
+                    None
+                    if judge_llm_api_key_file is None
+                    else judge_llm_api_key_file.expanduser().resolve()
+                ),
+                base_url=judge_llm_base_url,
+                proxy=judge_llm_proxy,
+                codex_home=(
+                    None
+                    if judge_llm_codex_home is None
+                    else judge_llm_codex_home.expanduser().resolve()
+                ),
+            )
+        except ValidationError as error:
+            detail = error.errors()[0].get("msg", "invalid Judge LLM options")
+            typer.echo(f"Error: {detail.removeprefix('Value error, ')}", err=True)
+            raise typer.Exit(2) from None
+
+    options = CompileOptions(
+        agent_name=agent,
+        primary_reward=primary_reward,
+        score_direction=score_direction,
+        agent_timeout_seconds=timeout,
+        max_submissions=max_submissions,
+        cooldown_seconds=cooldown,
+        disable_stop_hook=disable_stop_hook,
+    )
+    if cluster is not None:
+        cluster_request = ClusterRunRequest(
+            task_dir=task,
+            agent_name=agent,
+            options=options,
+            logs_root=roots.logs,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            agent_auth=agent_auth,
+            judge_llm=judge_llm,
+            dry_run=dry_run,
+            sandbox_policy=cluster_policy,
+        )
+        typer.echo(f"Running Agent {agent!r} on cluster {cluster!r}: {task.name}")
+        try:
+            adapter = build_cluster_adapter(
+                cluster,
+                event_callback=_ClusterConsole(),
+            )
+            started = time.monotonic()
+            with _terminate_as_interrupt():
+                cluster_result = adapter.run(cluster_request)
+        except BaseException as error:
+            _fail(error, verbose=verbose)
+            return
+        if dry_run:
+            typer.echo("\nDry-run complete; no jobs were submitted.")
+            return
+        _echo_cluster_result(cluster_result, time.monotonic() - started)
+        if oracle:
+            typer.echo("\nOracle check passed")
+        return
+
+    try:
+        service_options = {}
+        if sandbox_policy is not None:
+            service_options["engine_config"] = EngineConfig(
+                data_root=roots.data,
+                logs_root=roots.logs,
+                sandbox_policy=load_sandbox_policy(sandbox_policy),
+                sandbox_policy_path=sandbox_policy.expanduser().resolve(),
+            )
+        services = _services(
+            roots.data,
+            roots.logs,
+            event_callback=_RunConsole(),
+            **service_options,
+        )
+        available = services.available_agents()
+    except BaseException as error:
+        _fail(error, verbose=verbose)
+        return
+    if agent not in available:
+        typer.echo(
+            f"Error: unknown Agent {agent!r}; choose one of: {', '.join(available)}",
+            err=True,
+        )
+        raise typer.Exit(2)
+    pending_root = roots.data / "pending"
+    request = RunRequest(
+        task_dir=task,
+        agent_name=agent,
+        gpu_selectors=selectors,
+        options=options,
+        paths=RunPaths(
+            root=pending_root,
+            workspace=pending_root / "workspace",
+            logs=roots.logs,
+        ),
+        model=model,
+        reasoning_effort=reasoning_effort,
+        agent_auth=agent_auth,
+        judge_llm=judge_llm,
+    )
+    typer.echo(f"Running Agent {agent!r} on task: {task.name}")
+    typer.echo(_field("Task dir:", task))
+    typer.echo(_field("Timeout:", "task default" if timeout is None else f"{timeout}s"))
+    if model:
+        typer.echo(_field("Model:", model))
+    if reasoning_effort:
+        typer.echo(_field("Reasoning:", reasoning_effort))
+    typer.echo(_field("GPU selectors:", ", ".join(selectors) if selectors else "auto"))
+    if primary_reward:
+        typer.echo(_field("Primary reward:", primary_reward))
+    if max_submissions is not None:
+        typer.echo(_field("Max submissions:", max_submissions))
+    if cooldown:
+        typer.echo(_field("Cooldown:", f"{cooldown}s"))
+    if disable_stop_hook:
+        typer.echo(_field("Stop hook:", "disabled"))
+    if agent_auth is not None:
+        typer.echo(_field("Agent auth:", agent_auth.value))
+    if judge_llm is not None:
+        typer.echo(_field("Judge LLM auth:", judge_llm.auth.value))
+    typer.echo(_field("Data root:", roots.data))
+    typer.echo(_field("Logs root:", roots.logs))
+    typer.echo()
+
+    start = time.monotonic()
+    try:
+        result = services.run(request)
+    except BaseException as error:
+        _fail(error, verbose=verbose)
+        return
+    _echo_result(result, roots, time.monotonic() - start)
+    if oracle:
+        failures = _oracle_failures(
+            result,
+            (
+                max_submissions
+                if max_submissions is not None
+                else _planned_submissions(result)
+            )
+            or 1,
+        )
+        if failures:
+            typer.echo(f"\nOracle check failed: {'; '.join(failures)}", err=True)
+            raise typer.Exit(1)
+        typer.echo("\nOracle check passed")
+        return
+    if result.status in {RunStatus.FAILED, RunStatus.CANCELLED}:
+        raise typer.Exit(1)
+
+
+def _planned_submissions(result: RunResult) -> int | None:
+    """The submission budget the task gave the run, from its run plan."""
+    if result.artifacts_dir is None:
+        return None
+    plan = result.artifacts_dir / "run-plan.json"
+    if not plan.exists():
+        return None
+    verifier = json.loads(plan.read_text()).get("task", {}).get("verifier", {})
+    value = verifier.get("max_submissions")
+    return value if type(value) is int else None
+
+
+def _echo_cluster_result(result: ClusterRunResult, elapsed: float) -> None:
+    typer.echo(f"\nCluster run completed in {elapsed:.1f}s")
+    typer.echo(_field("Run ID:", result.run_id))
+    typer.echo(_field("Status:", result.status.value))
+    typer.echo(_field("Job IDs:", ", ".join(result.job_ids)))
+    typer.echo(_field("Logs:", result.log_dir))
+    if result.agent_stopped_by is not None:
+        typer.echo(_field("Agent stopped:", result.agent_stopped_by))
+    if result.status in {RunStatus.FAILED, RunStatus.CANCELLED}:
+        raise typer.Exit(1)
+
+
+def _echo_result(result: RunResult, roots: RuntimeRoots, elapsed: float) -> None:
+    typer.echo(f"\nRun completed in {elapsed:.1f}s")
+    typer.echo(_field("Run ID:", result.run_id))
+    typer.echo(_field("Status:", result.status.value))
+    typer.echo(_field("Rounds:", result.total_rounds))
+    typer.echo(
+        _field("Best score:", "-" if result.best_score is None else result.best_score)
+    )
+    typer.echo(_field("Best round:", result.best_round or "-"))
+    typer.echo(_field("Workspace:", roots.data / result.run_id / "workspace"))
+    typer.echo(_field("Logs:", roots.logs / "runs" / result.run_id))
+    if result.artifacts_dir is not None:
+        typer.echo(_field("Artifacts:", result.artifacts_dir))
+    if result.agent_exit_code is not None:
+        typer.echo(_field("Agent exit code:", result.agent_exit_code))
+    if result.agent_stopped_by is not None:
+        typer.echo(_field("Agent stopped:", result.agent_stopped_by))
+    if result.reports:
+        typer.echo()
+        typer.echo("Judge rounds:")
+        for report in result.reports:
+            score = "-" if report.score is None else report.score
+            exit_code = "-" if report.exit_code is None else report.exit_code
+            runtime = (
+                "-"
+                if report.duration_seconds is None
+                else f"{report.duration_seconds:.1f}s"
+            )
+            typer.echo(
+                f"  {report.round_id}: {report.status.value} score={score} "
+                f"exit_code={exit_code} runtime={runtime}"
+            )
+
+
+@app.command("resume")
+def resume_command(
+    run_id: Annotated[str, typer.Argument()],
+    add_time: Annotated[
+        float | None,
+        typer.Option("--add-time", min=0.0, help="Agent seconds to add to the run"),
+    ] = None,
+    add_submissions: Annotated[
+        int | None,
+        typer.Option("--add-submissions", min=1, help="Submissions to add"),
+    ] = None,
+    cooldown: Annotated[
+        float | None,
+        typer.Option("--cooldown", min=0.0, help="Replace the run's cooldown"),
+    ] = None,
+    gpus: Annotated[
+        str,
+        typer.Option(
+            "--gpus", help="Other GPUs of the same count; default: the run's selectors"
+        ),
+    ] = "",
+    data_root: Annotated[Path, typer.Option("--data-root")] = Path(".rsi-harness"),
+    logs_root: Annotated[Path, typer.Option("--logs-root")] = Path("logs"),
+    cluster: Annotated[
+        str | None,
+        typer.Option(
+            "--cluster",
+            help="Cluster name or profile TOML the run was submitted with",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the next attempt; change nothing"),
+    ] = False,
+    verbose: Annotated[bool, typer.Option("--verbose")] = False,
+) -> None:
+    """Continue a run that ended, however it ended, as its next attempt."""
+    from rsi_harness.runtime.recovery import AttemptGrants
+
+    if cluster is not None and gpus:
+        typer.echo(
+            "Error: --gpus is local-only and cannot be used with --cluster",
+            err=True,
+        )
+        raise typer.Exit(2)
+    try:
+        grants = AttemptGrants(
+            add_time_seconds=add_time or 0.0,
+            add_submissions=add_submissions or 0,
+            cooldown_seconds=cooldown,
+            gpu_selectors=_selectors(gpus) if gpus else None,
+        )
+    except typer.BadParameter as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(2) from None
+    except ValidationError as error:
+        problem = error.errors()[0]
+        typer.echo(f"Error: {problem['loc'][0]}: {problem['msg']}", err=True)
+        raise typer.Exit(2) from None
+    if cluster is not None:
+        try:
+            adapter = build_cluster_adapter(cluster, event_callback=_ClusterConsole())
+            plan = adapter.plan_resume(run_id, grants, dry_run=dry_run)
+        except BaseException as error:
+            _fail(error, verbose=verbose)
+            return
+        _echo_resume(plan.context)
+        typer.echo(_field("Walltime:", plan.spec.walltime))
+        if dry_run:
+            typer.echo("\nDry-run complete; nothing was changed.")
+            return
+        typer.echo()
+        started = time.monotonic()
+        try:
+            with _terminate_as_interrupt():
+                cluster_result = adapter.resume(plan)
+        except BaseException as error:
+            _fail(error, verbose=verbose)
+            return
+        _echo_cluster_result(cluster_result, time.monotonic() - started)
+        return
+    try:
+        roots = RuntimeRoots(
+            data=data_root.expanduser().resolve(),
+            logs=logs_root.expanduser().resolve(),
+        )
+        services = _services(roots.data, roots.logs, event_callback=_RunConsole())
+        context = services.plan_resume(run_id, grants, dry_run=dry_run)
+    except BaseException as error:
+        _fail(error, verbose=verbose)
+        return
+    _echo_resume(context)
+    if dry_run:
+        typer.echo("\nDry-run complete; nothing was changed.")
+        return
+    typer.echo()
+    start = time.monotonic()
+    try:
+        result = services.resume(context)
+    except BaseException as error:
+        _fail(error, verbose=verbose)
+        return
+    _echo_result(result, roots, time.monotonic() - start)
+    if result.status in {RunStatus.FAILED, RunStatus.CANCELLED}:
+        raise typer.Exit(1)
+
+
+def _echo_resume(context: ResumeContext) -> None:
+    left = context.submissions_left
+    typer.echo(f"Resuming run {context.run_id} as attempt {context.attempt}")
+    if context.salvage_pending:
+        typer.echo(_field("Salvage:", "runs first (the run did not end cleanly)"))
+    typer.echo(
+        _field(
+            "Agent time:",
+            f"{context.agent_seconds_used:.0f}s used, "
+            f"{context.agent_seconds_left:.0f}s left",
+        )
+    )
+    if context.final_judge:
+        typer.echo(_field("Final judge:", f"{context.next_round_id} ends the attempt"))
+    else:
+        typer.echo(
+            _field(
+                "Submissions:",
+                f"{context.charged_rounds} used, "
+                + ("unlimited" if left is None else f"{left} left"),
+            )
+        )
+        typer.echo(_field("Next round:", context.next_round_id))
+    if context.base_image_ref is not None:
+        typer.echo(_field("Base image:", context.base_image_ref))
+        if context.workdir_volume is not None:
+            typer.echo(_field("WORKDIR volume:", context.workdir_volume.name))
+
+
+@app.command("visualize")
+def visualize_command(
+    logs_root: Annotated[Path, typer.Option("--logs-root")] = Path("logs"),
+    data_root: Annotated[Path, typer.Option("--data-root")] = Path(".rsi-harness"),
+    host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", min=1, max=65535)] = 8000,
+) -> None:
+    import uvicorn
+
+    from rsi_loop.visualizer.server import create_app
+
+    roots = RuntimeRoots(
+        data=data_root.expanduser().resolve(),
+        logs=logs_root.expanduser().resolve(),
+    )
+    visualizer = create_app(
+        roots.logs / "runs", tasks_dir=roots.data / "generated-tasks"
+    )
+    uvicorn.run(visualizer, host=host, port=port)
+
+
+@app.command("serve")
+def serve_command(
+    host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", min=1, max=65535)] = 7472,
+    mode: Annotated[
+        Literal["lint", "prepare", "validate", "run"],
+        typer.Option(
+            "--mode",
+            help=(
+                "Default execution mode when a dispatch names none: run validates "
+                "the task's solution with the oracle Agent, then runs --agent"
+            ),
+        ),
+    ] = "run",
+    concurrency: Annotated[int, typer.Option("--concurrency", min=1)] = 1,
+    state_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--state-dir",
+            help="Intake records and bundles (default $RSI_INTAKE_STATE_DIR, "
+            "then .rsi-harness/intake)",
+        ),
+    ] = None,
+    data_root: Annotated[Path, typer.Option("--data-root")] = Path(".rsi-harness"),
+    agent: Annotated[str, typer.Option("--agent")] = "codex",
+    model: Annotated[str | None, typer.Option("--model")] = None,
+    reasoning_effort: Annotated[str | None, typer.Option("--reasoning-effort")] = None,
+    agent_auth: Annotated[AgentAuthSource | None, typer.Option("--agent-auth")] = None,
+    timeout: Annotated[float | None, typer.Option("--timeout", min=0.0)] = None,
+    gpus: Annotated[str, typer.Option("--gpus")] = "",
+    cluster: Annotated[str | None, typer.Option("--cluster")] = None,
+    sandbox_policy: Annotated[Path | None, typer.Option("--sandbox-policy")] = None,
+    judge_llm_auth: Annotated[
+        JudgeLLMAuth | None, typer.Option("--judge-llm-auth")
+    ] = None,
+    judge_llm_api_key_env: Annotated[
+        str | None, typer.Option("--judge-llm-api-key-env")
+    ] = None,
+    judge_llm_api_key_file: Annotated[
+        Path | None, typer.Option("--judge-llm-api-key-file")
+    ] = None,
+    judge_llm_base_url: Annotated[
+        str | None, typer.Option("--judge-llm-base-url")
+    ] = None,
+    judge_llm_proxy: Annotated[str | None, typer.Option("--judge-llm-proxy")] = None,
+    max_skew: Annotated[int, typer.Option("--max-skew", min=0)] = 300,
+    verbose: Annotated[bool, typer.Option("--verbose")] = False,
+) -> None:
+    """Serve the Runtime Task Intake API (ale.task.intake.v1) for task brewers.
+
+    Credentials come from the environment: RSI_INTAKE_SECRET (HMAC) and/or
+    RSI_INTAKE_TOKEN (Bearer); RSI_INTAKE_WEBHOOK_URL (a URL or "auto"),
+    RSI_INTAKE_WEBHOOK_SECRET, RSI_INTAKE_ALLOWED_ORIGINS (comma separated).
+    """
+    import os
+
+    import uvicorn
+
+    from rsi_harness.intake.executor import HarnessExecutor, RunProfile
+    from rsi_harness.intake.protocol import ExecutionMode
+    from rsi_harness.intake.server import create_app
+    from rsi_harness.intake.service import IntakeService, IntakeSettings
+
+    secret = os.environ.get("RSI_INTAKE_SECRET", "").strip()
+    token = os.environ.get("RSI_INTAKE_TOKEN", "").strip()
+    if not secret and not token:
+        typer.echo(
+            "Error: set RSI_INTAKE_SECRET and/or RSI_INTAKE_TOKEN to serve intake",
+            err=True,
+        )
+        raise typer.Exit(2)
+    # Refuse a profile `rsi-harness run` always rejects, rather than failing
+    # every dispatched task with the same error.
+    if cluster is not None and gpus:
+        typer.echo(
+            "Error: --gpus is local-only and cannot be used with --cluster", err=True
+        )
+        raise typer.Exit(2)
+    judge_llm_options = (
+        judge_llm_api_key_env,
+        judge_llm_api_key_file,
+        judge_llm_base_url,
+        judge_llm_proxy,
+    )
+    if judge_llm_auth is None and any(item is not None for item in judge_llm_options):
+        typer.echo("Error: the --judge-llm-* options need --judge-llm-auth", err=True)
+        raise typer.Exit(2)
+    state = state_dir or Path(
+        os.environ.get("RSI_INTAKE_STATE_DIR") or ".rsi-harness/intake"
+    )
+    origins = tuple(
+        item.strip()
+        for item in os.environ.get("RSI_INTAKE_ALLOWED_ORIGINS", "").split(",")
+        if item.strip()
+    )
+    settings = IntakeSettings(
+        secret=secret,
+        token=token,
+        webhook_url=os.environ.get("RSI_INTAKE_WEBHOOK_URL", "").strip(),
+        webhook_secret=os.environ.get("RSI_INTAKE_WEBHOOK_SECRET", "").strip(),
+        allowed_origins=origins,
+        state_dir=state.expanduser().resolve(),
+        default_mode=ExecutionMode(mode),
+        concurrency=concurrency,
+        max_skew_sec=max_skew,
+    )
+    profile = RunProfile(
+        agent=agent,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        agent_auth=None if agent_auth is None else agent_auth.value,
+        timeout=timeout,
+        gpus=gpus,
+        cluster=cluster,
+        sandbox_policy=None
+        if sandbox_policy is None
+        else sandbox_policy.expanduser().resolve(),
+        judge_llm_auth=None if judge_llm_auth is None else judge_llm_auth.value,
+        judge_llm_api_key_env=judge_llm_api_key_env,
+        judge_llm_api_key_file=None
+        if judge_llm_api_key_file is None
+        else judge_llm_api_key_file.expanduser().resolve(),
+        judge_llm_base_url=judge_llm_base_url,
+        judge_llm_proxy=judge_llm_proxy,
+        data_root=data_root.expanduser().resolve(),
+        verbose=verbose,
+    )
+    service = IntakeService(settings, HarnessExecutor(profile))
+    typer.echo(
+        f"Serving task intake on {host}:{port} (default mode {mode}, "
+        f"agent {agent!r}, state {settings.state_dir})"
+    )
+    uvicorn.run(create_app(service), host=host, port=port)
+
+
+_CLUSTER_RECOVERY_HELP = (
+    "Cluster name or profile TOML: kill the run's remote sandboxes "
+    "(after its scheduler job has ended)"
+)
+
+
+def _recover_cluster(cluster: str, run_id: str | None) -> tuple[str, ...]:
+    from rsi_harness.cluster.bluevela.sandbox import recover_cluster_sandboxes
+    from rsi_harness.cluster.config import load_cluster_profile
+
+    profile = load_cluster_profile(cluster)
+    return recover_cluster_sandboxes(profile.storage.run_root, run_id)
+
+
+@app.command("recover")
+def recover_command(
+    run_id: Annotated[str | None, typer.Argument()] = None,
+    data_root: Annotated[Path, typer.Option("--data-root")] = Path(".rsi-harness"),
+    logs_root: Annotated[Path, typer.Option("--logs-root")] = Path("logs"),
+    cluster: Annotated[
+        str | None, typer.Option("--cluster", help=_CLUSTER_RECOVERY_HELP)
+    ] = None,
+    verbose: Annotated[bool, typer.Option("--verbose")] = False,
+) -> None:
+    try:
+        recovered = (
+            _recover_cluster(cluster, run_id)
+            if cluster is not None
+            else _services(data_root, logs_root).recover(run_id)
+        )
+    except BaseException as error:
+        _fail(error, verbose=verbose)
+        return
+    for selected in recovered:
+        typer.echo(f"recovered: {selected}")
+
+
+@app.command("cleanup")
+def cleanup_command(
+    run_id: Annotated[str, typer.Argument()],
+    delete_workspace: Annotated[bool, typer.Option("--delete-workspace")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+    data_root: Annotated[Path, typer.Option("--data-root")] = Path(".rsi-harness"),
+    logs_root: Annotated[Path, typer.Option("--logs-root")] = Path("logs"),
+    cluster: Annotated[
+        str | None, typer.Option("--cluster", help=_CLUSTER_RECOVERY_HELP)
+    ] = None,
+    verbose: Annotated[bool, typer.Option("--verbose")] = False,
+) -> None:
+    if cluster is not None:
+        if delete_workspace:
+            typer.echo(
+                "Error: --delete-workspace is local-only and cannot be used "
+                "with --cluster",
+                err=True,
+            )
+            raise typer.Exit(2)
+        try:
+            _recover_cluster(cluster, run_id)
+        except BaseException as error:
+            _fail(error, verbose=verbose)
+            return
+        typer.echo(f"cleaned: {run_id}")
+        return
+    if delete_workspace and not yes:
+        confirmed = typer.confirm(
+            f"Delete the retained workspace for {run_id}?",
+            default=False,
+        )
+        if not confirmed:
+            typer.echo("Cleanup cancelled", err=True)
+            raise typer.Exit(1)
+    try:
+        _services(data_root, logs_root).cleanup(
+            run_id, delete_workspace=delete_workspace
+        )
+    except BaseException as error:
+        _fail(error, verbose=verbose)
+        return
+    typer.echo(f"cleaned: {run_id}")
+
+
+_DURATION = re.compile(r"([1-9][0-9]{0,8})([smhdw])")
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def _duration(value: str) -> float:
+    match = _DURATION.fullmatch(value.strip())
+    if match is None:
+        raise typer.BadParameter("expected a duration such as 45m, 12h, 7d or 2w")
+    return float(int(match.group(1)) * _DURATION_UNITS[match.group(2)])
+
+
+def _size(value: int) -> str:
+    if value < 1024:
+        return f"{value} B"
+    size = float(value)
+    for unit in ("KiB", "MiB", "GiB"):
+        size /= 1024
+        if size < 1024:
+            break
+    return f"{size:.1f} {unit}"
+
+
+def _prune_table(rows: tuple[PruneRow, ...]) -> None:
+    typer.echo(
+        f"{'IMAGE':<12}  {'SIZE':>10}  {'LAST USED':<20}  {'ACTION':<12}  "
+        f"{'REASON':<40}  REFERENCES"
+    )
+    for row in rows:
+        image = row.image
+        typer.echo(
+            f"{image.image_id.removeprefix('sha256:')[:12]:<12}  "
+            f"{_size(row.bytes) if row.bytes else '-':>10}  "
+            f"{image.last_used_at.strftime('%Y-%m-%d %H:%M UTC'):<20}  "
+            f"{row.action:<12}  {row.reason or '-':<40}  "
+            f"{', '.join(image.references) or '-'}"
+        )
+
+
+@sandbox_app.command("prune-images")
+def prune_images_command(
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="List what would be removed; change nothing"),
+    ] = False,
+    older_than: Annotated[
+        str | None,
+        typer.Option(
+            "--older-than",
+            metavar="DURATION",
+            help="Only images last used longer ago than this (45m, 12h, 7d, 2w)",
+        ),
+    ] = None,
+    yes: Annotated[
+        bool, typer.Option("--yes", help="Remove without asking for confirmation")
+    ] = False,
+    data_root: Annotated[Path, typer.Option("--data-root")] = Path(".rsi-harness"),
+    logs_root: Annotated[Path, typer.Option("--logs-root")] = Path("logs"),
+    verbose: Annotated[bool, typer.Option("--verbose")] = False,
+) -> None:
+    """Remove the images brokered pulls first brought to this host.
+
+    Only images in the data root's pull ledger are candidates; images that
+    were on the host before the sandbox first pulled them are never touched.
+    Only this data root's run leases are checked: do not prune while runs
+    under another data root use the same images.
+    """
+    from rsi_harness.runtime.sandbox_ledger import REMOVED, WOULD_REMOVE
+
+    try:
+        older_than_seconds = None if older_than is None else _duration(older_than)
+    except typer.BadParameter as error:
+        typer.echo(f"Error: --older-than: {error}", err=True)
+        raise typer.Exit(2) from None
+
+    asked = False
+
+    def confirm(rows: tuple[PruneRow, ...]) -> bool:
+        nonlocal asked
+        if yes:
+            return True
+        asked = True
+        _prune_table(rows)
+        count = sum(1 for row in rows if row.action == WOULD_REMOVE)
+        return typer.confirm(f"Remove {count} pulled image(s)?", default=False)
+
+    try:
+        rows = _services(data_root, logs_root).prune_images(
+            older_than_seconds=older_than_seconds, dry_run=dry_run, confirm=confirm
+        )
+    except BaseException as error:
+        _fail(error, verbose=verbose)
+        return
+    if rows is None:
+        typer.echo("Prune cancelled", err=True)
+        raise typer.Exit(1)
+    if not rows:
+        typer.echo("No pulled images are recorded in the pull ledger.")
+        return
+    if asked:
+        typer.echo("Result:")
+    _prune_table(rows)
+    action = WOULD_REMOVE if dry_run else REMOVED
+    freed = sum(row.bytes for row in rows if row.action == action)
+    label = "Would free" if dry_run else "Freed"
+    typer.echo(f"{label}: {freed} bytes ({_size(freed)})")
+
+
+if __name__ == "__main__":
+    app()

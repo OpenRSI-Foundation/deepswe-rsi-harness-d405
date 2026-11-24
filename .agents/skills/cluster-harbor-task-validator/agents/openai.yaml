@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cluster Harbor Task Validator"
+  short_description: "Validate a task on LSF, Slurm, Kubernetes, PBS or PJM"
+  default_prompt: "Use $cluster-harbor-task-validator to validate the existing task on the selected cluster, applying the task's General or Science acceptance and publication rules, then stop before research."

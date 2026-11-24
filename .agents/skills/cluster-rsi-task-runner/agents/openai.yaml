@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cluster RSI Task Runner"
+  short_description: "Run a validated task on LSF, Slurm, Kubernetes, PBS or PJM"
+  default_prompt: "Use $cluster-rsi-task-runner to discover and run this repository’s validated task with its accepted cluster profile and budget, applying the task's General or Science execution and publication rules."

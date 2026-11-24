@@ -1,0 +1,78 @@
+# Proposed local Docker grant. Review ECR inputs and pre-pull the frozen digests.
+# No builds, child egress, privileged nesting, or published ports are granted.
+# Reservation: 28 CPUs, 114688 MiB plus broker headroom and metadata.
+pool_cpus = 32
+pool_memory_mb = 131072
+
+[environments.host]
+backend = "docker"
+pool_disk_mb = 2097152
+disk_floor_mb = 102400
+disk_hard_floor_mb = 20480
+request_slots_active = 32
+request_slots_queued = 64
+waiters = 64
+no_new_privileges = true
+
+[environments.work]
+network = ["none"]
+pull = true
+registries = ["public.ecr.aws"]
+max_envs_live = 2
+max_envs_created = 256
+max_services_per_env = 1
+max_containers_live = 2
+max_cpus_live = 4
+max_memory_mb_live = 16384
+max_disk_mb_live = 40960
+cpus_per_container = 2
+memory_mb_per_container = 8192
+swap_ratio = 0.0
+pids_per_container = 8192
+disk_mb_per_container = 20480
+max_env_lifetime_sec = 14400
+max_wait_timeout_sec = 300
+max_execs_running = 32
+max_exec_output_bytes = 16777216
+max_jobs_running = 4
+max_pull_mb = 2097152
+max_log_bytes = 17179869184
+max_upload_bytes = 549755813888
+max_download_bytes = 549755813888
+max_operations = 20000000
+
+[environments.judge]
+network = ["none"]
+pull = true
+registries = ["public.ecr.aws"]
+max_envs_live = 8
+max_envs_created = 512
+max_services_per_env = 1
+max_containers_live = 8
+max_cpus_live = 16
+max_memory_mb_live = 65536
+max_disk_mb_live = 163840
+cpus_per_container = 2
+memory_mb_per_container = 8192
+swap_ratio = 0.0
+pids_per_container = 8192
+disk_mb_per_container = 20480
+max_env_lifetime_sec = 14400
+max_wait_timeout_sec = 300
+max_execs_running = 32
+max_exec_output_bytes = 16777216
+max_jobs_running = 4
+max_pull_mb = 2097152
+max_log_bytes = 17179869184
+max_upload_bytes = 549755813888
+max_download_bytes = 549755813888
+max_operations = 40000000
+
+[environments.run_limits]
+max_envs_created = 2048
+max_operations = 160000000
+max_builds = 1
+max_pull_mb = 4194304
+max_upload_bytes = 2199023255552
+max_download_bytes = 2199023255552
+max_log_bytes = 68719476736

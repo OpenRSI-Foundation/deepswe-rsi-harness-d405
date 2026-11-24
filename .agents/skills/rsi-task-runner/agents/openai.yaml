@@ -1,0 +1,4 @@
+interface:
+  display_name: "RSI Task Runner"
+  short_description: "Run one Harbor task safely with RSI-Harness"
+  default_prompt: "Use $rsi-task-runner to inspect and run the Harbor task in this repository with an explicit runtime and submission budget."

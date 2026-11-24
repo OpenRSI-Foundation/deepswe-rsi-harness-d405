@@ -1,0 +1,806 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import replace
+from pathlib import Path, PurePosixPath
+
+import pytest
+
+from rsi_harness.errors import InfrastructureError
+from rsi_harness.integrations.rsi_loop import RSILoopAgentAdapter
+from rsi_harness.models import (
+    AgentHookRequest,
+    AgentPrepareRequest,
+    AgentRunRequest,
+    AgentRunResult,
+    ContainerRef,
+    NetworkPolicy,
+)
+from rsi_loop.harness.config import RSILoopConfig
+from tests.factories import make_run_plan
+from tests.integrations.test_rsi_loop import RecordingAgentRuntime
+
+SESSION = "01a16125-90ff-70a0-8d09-1a36fffb91d0"
+CAPACITY = "ERROR: Selected model is at capacity. Please try a different model."
+HEADER = f"OpenAI Codex v0.159.2\n--------\nsession id: {SESSION}\n--------\n"
+
+
+class FakeClock:
+    now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class SequenceRuntime(RecordingAgentRuntime):
+    """Simulate exec's deadline, streaming log and in-container retry delay."""
+
+    def __init__(
+        self, clock: FakeClock, results: list[AgentRunResult | BaseException]
+    ) -> None:
+        super().__init__()
+        self.clock = clock
+        self.results = list(results)
+        self.start_callbacks: list[object] = []
+        self.copied_text: dict[PurePosixPath, str] = {}
+        # Seconds each exec works before its result (2 when not given).
+        self.work_seconds: list[float] = []
+        self.copy_seconds = 0.0
+        self.exec_starts: list[float] = []
+
+    def copy_to(self, container, source, target):
+        self.clock.now += self.copy_seconds
+        self.copied_text[target] = source.read_text()
+        super().copy_to(container, source, target)
+
+    def exec(self, container, command, *, on_exec_start=None, **kwargs):
+        self.start_callbacks.append(on_exec_start)
+        self.exec_starts.append(self.clock.now)
+        if on_exec_start is not None:
+            on_exec_start(self.clock.now)
+        super().exec(container, command, **kwargs)
+        assert self.results, "unexpected additional exec"
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        script = command if isinstance(command, str) else command[-1]
+        sleep = re.search(r"\bsleep\s+([0-9.]+)", script)
+        work = self.work_seconds.pop(0) if self.work_seconds else 2.0
+        elapsed = work + (float(sleep.group(1)) if sleep else 0.0)
+        timeout = kwargs.get("timeout_seconds")
+        if timeout is not None and elapsed > timeout:
+            elapsed = timeout
+            result = AgentRunResult(exit_code=124, timed_out=True)
+        self.clock.now += elapsed
+        safe = result.output
+        for secret in kwargs.get("output_redact_values", ()):
+            safe = safe.replace(secret, "[REDACTED]")
+        path = kwargs.get("output_path")
+        if path is not None:
+            with path.open("a") as output:
+                output.write(safe)
+        callback = kwargs.get("output_callback")
+        if callback is not None:
+            callback(safe)
+        return result
+
+
+def capacity_result(*, ansi: bool = False) -> AgentRunResult:
+    output = HEADER + (f"\x1b[31m{CAPACITY}\x1b[0m" if ansi else CAPACITY) + "\n"
+    return AgentRunResult(exit_code=1, output=output, full_output_captured=True)
+
+
+def make_adapter(tmp_path, monkeypatch, results, *, agent="codex", public=False):
+    clock = FakeClock()
+    monkeypatch.setattr("rsi_harness.integrations.rsi_loop.time.monotonic", clock)
+    runtime = SequenceRuntime(clock, results)
+    config = RSILoopConfig(agent_api_key="provider-secret")
+    adapter = RSILoopAgentAdapter(config, runtime=runtime)
+    plan = make_run_plan(tmp_path)
+    plan = plan.model_copy(
+        update={
+            "task": plan.task.model_copy(
+                update={
+                    "agent": plan.task.agent.model_copy(
+                        update={
+                            "name": agent,
+                            "model": "gpt-6-astra" if agent == "codex" else None,
+                            "reasoning_effort": "max" if agent == "codex" else None,
+                            "install_stop_hook": False,
+                            "network": NetworkPolicy(
+                                mode="public" if public else "no-network"
+                            ),
+                        }
+                    )
+                }
+            )
+        }
+    )
+    prepared = adapter.prepare(
+        AgentPrepareRequest(run_plan=plan, prompt_path=tmp_path / "prompt.md")
+    )
+    container = ContainerRef(container_id="same-live-work", role="work")
+    adapter.install_hooks(
+        AgentHookRequest(
+            run_plan=plan,
+            container=container,
+            submit_url="http://control.internal:8123",
+            token="control-secret",
+        )
+    )
+    request = AgentRunRequest(
+        prepared=prepared, container=container, timeout_seconds=600.0
+    )
+    return adapter, runtime, clock, request
+
+
+@pytest.mark.parametrize("public", [False, True])
+def test_capacity_retries_same_session_without_clearing_work_or_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, public: bool
+) -> None:
+    results = [
+        capacity_result(ansi=True),
+        capacity_result(),
+        AgentRunResult(
+            exit_code=0,
+            output="continued training provider-secret control-secret\n",
+            full_output_captured=True,
+        ),
+    ]
+    adapter, runtime, clock, request = make_adapter(
+        tmp_path, monkeypatch, results, public=public
+    )
+    deadlines, live = [], []
+    output_path = tmp_path / "agent_output.txt"
+    output_path.write_text("earlier attempt preserved\n")
+    request = replace(
+        request,
+        on_exec_start=deadlines.append,
+        output_path=output_path,
+        output_callback=live.append,
+        output_redact_values=("extra-secret",),
+    )
+
+    result = adapter.run(request)
+
+    assert result.exit_code == 0
+    assert result.full_output_captured
+    assert len(runtime.executions) == 3
+    assert deadlines == [1000.0]
+    assert runtime.start_callbacks[1:] == [None, None]
+    assert [call["timeout_seconds"] for call in runtime.executions] == [600, 598, 566]
+    assert clock.now == 1096.0
+    for index, call in enumerate(runtime.executions):
+        assert call["container"] == "same-live-work"
+        assert call["output_path"] == output_path
+        assert call["output_callback"] is request.output_callback
+        assert call["environment"]["RSI_TOKEN"] == "control-secret"
+        assert call["environment"]["RSI_JUDGE_URL"] == "http://control.internal:8123"
+        assert set(call["output_redact_values"]) >= {
+            "control-secret",
+            "provider-secret",
+            "extra-secret",
+        }
+        if index:
+            command = call["command"][-1]
+            assert "codex exec resume" in command
+            assert SESSION in command and "--last" not in command
+            assert "--model gpt-6-astra" in command
+            assert 'model_reasoning_effort="max"' in command
+            assert ('web_search="disabled"' in command) is (not public)
+            assert f"sleep {30 * index}" in command
+    prompt = runtime.copied_text[PurePosixPath("/tmp/rsi-agent-provider-retry.md")]
+    assert prompt.strip()
+    assert "provider-secret" not in prompt and "control-secret" not in prompt
+    full_log = output_path.read_text()
+    assert full_log.startswith("earlier attempt preserved\n")
+    assert full_log.count(CAPACITY) == 2
+    for output in (result.output, full_log, "".join(live)):
+        assert CAPACITY in output and "continued training" in output
+        assert "provider-secret" not in output and "control-secret" not in output
+    with pytest.raises(InfrastructureError, match="control environment"):
+        adapter.run(request)
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        replace(capacity_result(), exit_code=0),
+        replace(capacity_result(), exit_code=2),
+        replace(capacity_result(), timed_out=True),
+        replace(capacity_result(), cancelled=True),
+        replace(capacity_result(), exec_started=False),
+        replace(capacity_result(), output=HEADER + "ERROR: HTTP 401 Unauthorized\n"),
+        replace(
+            capacity_result(), output=HEADER + "ERROR: HTTP 400 unsupported model\n"
+        ),
+        replace(capacity_result(), output=HEADER + "ERROR: network disconnected\n"),
+        replace(capacity_result(), output=CAPACITY + "\n"),
+        replace(capacity_result(), output=HEADER + CAPACITY + "\nERROR: HTTP 401\n"),
+    ],
+    ids=[
+        "success",
+        "wrong-exit",
+        "timeout",
+        "cancel",
+        "not-started",
+        "auth",
+        "unsupported",
+        "network",
+        "no-session",
+        "later-auth",
+    ],
+)
+def test_only_explicit_terminal_capacity_failure_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: AgentRunResult
+) -> None:
+    adapter, runtime, _, request = make_adapter(tmp_path, monkeypatch, [first])
+
+    result = adapter.run(request)
+
+    assert len(runtime.executions) == 1
+    assert result.exit_code == first.exit_code
+    assert result.timed_out == first.timed_out
+    assert result.cancelled == first.cancelled
+
+
+def test_earlier_capacity_does_not_mask_later_authentication_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, runtime, _, request = make_adapter(
+        tmp_path,
+        monkeypatch,
+        [
+            capacity_result(),
+            AgentRunResult(exit_code=1, output=HEADER + "ERROR: HTTP 401\n"),
+        ],
+    )
+
+    result = adapter.run(request)
+
+    assert len(runtime.executions) == 2
+    assert result.exit_code == 1
+    assert CAPACITY in result.output and "HTTP 401" in result.output
+
+
+def test_capacity_is_recognized_before_codex_shutdown_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = (
+        HEADER + CAPACITY + "\n"
+        "2026-10-22T02:45:00.123Z ERROR codex_core::session: "
+        "failed to record rollout items: channel closed\n"
+        "2026-10-22T02:45:00.456Z ERROR codex_core::session: "
+        "failed to record rollout items: channel closed\n"
+        "tokens used\n328,685\n"
+    )
+    adapter, runtime, _, request = make_adapter(
+        tmp_path,
+        monkeypatch,
+        [AgentRunResult(exit_code=1, output=output), AgentRunResult(exit_code=0)],
+    )
+
+    result = adapter.run(request)
+
+    assert len(runtime.executions) == 2
+    assert result.exit_code == 0
+    assert output in result.output
+
+
+@pytest.mark.parametrize("suffix", ["ordinary tool output\n", "fatal: bad config\n"])
+def test_non_capacity_terminal_output_prevents_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    adapter, runtime, _, request = make_adapter(
+        tmp_path,
+        monkeypatch,
+        [AgentRunResult(exit_code=1, output=HEADER + CAPACITY + "\n" + suffix)],
+    )
+
+    result = adapter.run(request)
+
+    assert len(runtime.executions) == 1
+    assert result.exit_code == 1
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, SystemExit])
+def test_cancellation_during_retry_propagates_and_clears_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+) -> None:
+    adapter, runtime, _, request = make_adapter(
+        tmp_path, monkeypatch, [capacity_result(), error()]
+    )
+
+    with pytest.raises(error):
+        adapter.run(request)
+
+    assert len(runtime.executions) == 2
+    with pytest.raises(InfrastructureError, match="control environment"):
+        adapter.run(request)
+
+
+def test_session_quoted_later_by_tool_does_not_replace_current_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    previous_session = "01a15f85-9d09-7d71-ab60-5463a6a25b99"
+    output = (
+        HEADER + "exec\ncat old-trajectory.txt\n"
+        f"session id: {previous_session}\n" + CAPACITY + "\n"
+    )
+    adapter, runtime, _, request = make_adapter(
+        tmp_path,
+        monkeypatch,
+        [AgentRunResult(exit_code=1, output=output), AgentRunResult(exit_code=0)],
+    )
+
+    result = adapter.run(request)
+
+    assert result.exit_code == 0
+    command = runtime.executions[1]["command"][-1]
+    assert SESSION in command
+    assert previous_session not in command and "--last" not in command
+
+
+@pytest.mark.parametrize("key", ["code", "codex_error_info"])
+def test_structured_server_overloaded_error_can_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    output = HEADER + f'ERROR: {{"error": {{"{key}": "server_overloaded"}}}}\n'
+    adapter, runtime, _, request = make_adapter(
+        tmp_path,
+        monkeypatch,
+        [AgentRunResult(exit_code=1, output=output), AgentRunResult(exit_code=0)],
+    )
+
+    result = adapter.run(request)
+
+    assert result.exit_code == 0
+    assert len(runtime.executions) == 2
+
+
+@pytest.mark.parametrize("budget", [2.0, 12.0])
+def test_backoff_never_extends_original_time_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, budget: float
+) -> None:
+    adapter, runtime, clock, request = make_adapter(
+        tmp_path, monkeypatch, [capacity_result(), capacity_result()]
+    )
+
+    result = adapter.run(replace(request, timeout_seconds=budget))
+
+    assert clock.now <= 1000.0 + budget
+    # Past the deadline it timed out; short of the next wait it stopped.
+    assert result.timed_out or result.provider_error == "at_capacity"
+    assert len(runtime.executions) <= 2
+    for execution in runtime.executions:
+        assert 0 < execution["timeout_seconds"] <= budget
+
+
+def test_a_slow_retry_prompt_copy_does_not_extend_the_time_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, runtime, clock, request = make_adapter(
+        tmp_path, monkeypatch, [capacity_result(), AgentRunResult(exit_code=0)]
+    )
+    runtime.work_seconds = [2.0, 1000.0]
+    runtime.copy_seconds = 5.0
+
+    result = adapter.run(replace(request, timeout_seconds=100.0))
+
+    assert result.timed_out
+    assert clock.now == runtime.exec_starts[0] + 100.0
+
+
+def test_backoff_is_capped_and_can_recover_after_repeated_overloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, runtime, clock, request = make_adapter(
+        tmp_path,
+        monkeypatch,
+        [capacity_result() for _ in range(6)] + [AgentRunResult(exit_code=0)],
+    )
+
+    result = adapter.run(replace(request, timeout_seconds=2000.0))
+
+    assert result.exit_code == 0
+    delays = [
+        float(re.search(r"\bsleep\s+([0-9.]+)", call["command"][-1]).group(1))
+        for call in runtime.executions[1:]
+    ]
+    assert delays == [30, 60, 120, 240, 480, 900]
+    assert clock.now == 1000 + sum(delays) + 2 * 7
+    assert result.provider_error is None
+    assert (result.provider_retries, result.provider_wait_seconds) == (6, 1830)
+
+
+@pytest.mark.parametrize("kind", ["other-agent", "custom-command", "unprepared"])
+def test_retry_requires_adapter_prepared_codex_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    adapter, runtime, _, request = make_adapter(
+        tmp_path,
+        monkeypatch,
+        [capacity_result()],
+        agent="claude-code" if kind == "other-agent" else "codex",
+    )
+    if kind == "custom-command":
+        request = replace(
+            request,
+            prepared=replace(
+                request.prepared, command=("/bin/bash", "-c", "custom-agent")
+            ),
+        )
+    elif kind == "unprepared":
+        # This adapter receives a PreparedAgent supplied by a custom caller,
+        # without the trusted recipe it would have stored during prepare().
+        adapter.clear_transient_bindings()
+        plan = make_run_plan(tmp_path)
+        plan = plan.model_copy(
+            update={
+                "task": plan.task.model_copy(
+                    update={
+                        "agent": plan.task.agent.model_copy(
+                            update={"install_stop_hook": False}
+                        )
+                    }
+                )
+            }
+        )
+        adapter.install_hooks(
+            AgentHookRequest(
+                run_plan=plan,
+                container=request.container,
+                submit_url="http://control.internal:8123",
+                token="control-secret",
+            )
+        )
+
+    result = adapter.run(request)
+
+    assert result.exit_code == 1
+    assert len(runtime.executions) == 1
+
+
+def test_generated_capacity_resume_shell_runs_with_exact_session_and_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise shell quoting/stdin without Docker, model calls or real HOME."""
+    monkeypatch.setattr("rsi_loop.harness.agent.codex._SESSION_STORE", "true")
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    calls_path = tmp_path / "codex-calls.jsonl"
+    codex = binaries / "codex"
+    codex.write_text(
+        f"#!{sys.executable}\n"
+        "import json, pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        f"with pathlib.Path({str(calls_path)!r}).open('a') as trace:\n"
+        "    trace.write(json.dumps(args) + '\\n')\n"
+        "assert args[0] == 'exec', args\n"
+        "assert args[args.index('--model') + 1] == 'gpt-6-astra', args\n"
+        "assert 'model_reasoning_effort=\"max\"' in args, args\n"
+        "assert 'web_search=disabled' in args, args\n"
+        "if args[1] == 'resume':\n"
+        f"    assert {SESSION!r} in args and '--last' not in args, args\n"
+        "    assert args[-1] == '-', args\n"
+        "    prompt = sys.stdin.read()\n"
+        "    assert 'temporarily at capacity' in prompt, prompt\n"
+        "    assert 'background training' in prompt, prompt\n"
+        "    print('SAME_SESSION_RECOVERED')\n"
+        "else:\n"
+        f"    print({HEADER!r}, end='', flush=True)\n"
+        f"    print({CAPACITY!r}, file=sys.stderr, flush=True)\n"
+        "    sys.exit(1)\n"
+    )
+    codex.chmod(0o755)
+    sleep = binaries / "sleep"
+    sleep.write_text("#!/bin/sh\nexit 0\n")
+    sleep.chmod(0o755)
+
+    class LocalRuntime(RecordingAgentRuntime):
+        def __init__(self):
+            super().__init__()
+            self.targets = {}
+
+        def copy_to(self, container, source, target):
+            super().copy_to(container, source, target)
+            destination = tmp_path / "container" / str(target).lstrip("/")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            self.targets[target] = destination
+
+        def exec(self, container, command, **kwargs):
+            super().exec(container, command, **kwargs)
+            argv = list(command)
+            for target, destination in self.targets.items():
+                argv = [part.replace(str(target), str(destination)) for part in argv]
+            completed = subprocess.run(
+                argv,
+                cwd=tmp_path,
+                env={
+                    "PATH": f"{binaries}:{os.defpath}",
+                    **kwargs.get("environment", {}),
+                },
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=kwargs["timeout_seconds"],
+            )
+            with kwargs["output_path"].open("a") as output:
+                output.write(completed.stdout)
+            return AgentRunResult(
+                exit_code=completed.returncode,
+                output=completed.stdout,
+                full_output_captured=True,
+            )
+
+    plan = make_run_plan(tmp_path)
+    plan = plan.model_copy(
+        update={
+            "task": plan.task.model_copy(
+                update={
+                    "agent": plan.task.agent.model_copy(
+                        update={
+                            "model": "gpt-6-astra",
+                            "reasoning_effort": "max",
+                            "install_stop_hook": False,
+                        }
+                    )
+                }
+            )
+        }
+    )
+    runtime = LocalRuntime()
+    adapter = RSILoopAgentAdapter(RSILoopConfig(), runtime=runtime)
+    prepared = adapter.prepare(
+        AgentPrepareRequest(run_plan=plan, prompt_path=tmp_path / "prompt.md")
+    )
+    work = ContainerRef(container_id="local-smoke-work", role="work")
+    adapter.install_hooks(
+        AgentHookRequest(
+            run_plan=plan,
+            container=work,
+            submit_url="http://control.internal:8123",
+            token="test-token",
+        )
+    )
+    output_path = tmp_path / "agent_output.txt"
+    output_path.write_text("old attempt\n")
+
+    result = adapter.run(
+        AgentRunRequest(
+            prepared=prepared,
+            container=work,
+            timeout_seconds=100.0,
+            output_path=output_path,
+        )
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(runtime.executions) == 2
+    calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
+    assert len(calls) == 2 and calls[1][1] == "resume"
+    for output in (result.output, output_path.read_text()):
+        assert HEADER in output and CAPACITY in output
+        assert "retry 1 in 30s" in output
+        assert "SAME_SESSION_RECOVERED" in output
+    assert output_path.read_text().startswith("old attempt\n")
+
+
+def test_apptainer_verbose_capacity_result_retries_same_session_within_budget(
+    tmp_path, monkeypatch
+):
+    from tests.cluster.bluevela.test_runtime import _capture_verbose_codex_result
+
+    # Produce the >16 MB result through the real Apptainer capture method before
+    # installing the fake retry clock. No model or container is required here.
+    first, complete_log, _, _ = _capture_verbose_codex_result(tmp_path, monkeypatch)
+    assert complete_log.stat().st_size > 16_000_000
+    assert first.output_truncated
+    adapter, runtime, clock, request = make_adapter(
+        tmp_path, monkeypatch, [first, AgentRunResult(exit_code=0, output="resumed\n")]
+    )
+    started = []
+    result = adapter.run(replace(request, on_exec_start=started.append))
+
+    assert result.exit_code == 0
+    assert result.output_truncated
+    assert len(runtime.executions) == 2
+    assert [call["timeout_seconds"] for call in runtime.executions] == [600, 598]
+    assert clock.now == 1034
+    assert started == [1000.0]
+    command = runtime.executions[1]["command"][-1]
+    assert "codex exec resume" in command
+    assert SESSION in command and "--last" not in command
+    assert "sleep 30" in command
+    assert CAPACITY in result.output
+    assert "private-secret" not in result.output
+
+
+RATE_LIMITED = (
+    "ERROR: exceeded retry limit, last status: 429 Too Many Requests, "
+    "request id: req_0123"
+)
+
+
+def provider_result(error: str) -> AgentRunResult:
+    output = HEADER + "Reconnecting... 1/5\nReconnecting... 2/5\n" + error + "\n"
+    return AgentRunResult(exit_code=1, output=output, full_output_captured=True)
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (CAPACITY, "at_capacity"),
+        (RATE_LIMITED, "rate_limited"),
+        (
+            "ERROR: exceeded retry limit, last status: 429 Too Many Requests",
+            "rate_limited",
+        ),
+        (
+            "ERROR: exceeded retry limit, last status: 503 Service Unavailable",
+            "unavailable",
+        ),
+        ('ERROR: {"error": {"code": "rate_limit_exceeded"}}', "rate_limited"),
+        ("ERROR: exceeded retry limit, last status: 401 Unauthorized", None),
+        ("ERROR: You've hit your usage limit. Try again later.", None),
+        ("ERROR: Quota exceeded. Check your plan and billing details.", None),
+        ("ERROR: unexpected status 400 Bad Request: bad model", None),
+        (
+            "ERROR: unexpected status 503 Service Unavailable: upstream down, "
+            "request id: req_0123",
+            "unavailable",
+        ),
+        ("ERROR: unexpected status 502 Bad Gateway", "unavailable"),
+        (
+            "ERROR: We're currently experiencing high demand, which may cause "
+            "temporary errors.",
+            "unavailable",
+        ),
+        (
+            "ERROR: We\u2019re currently experiencing high demand, which may cause "
+            "temporary errors.",
+            "unavailable",
+        ),
+        (
+            "ERROR: unexpected status 502 Bad Gateway: <html>\n<body>\n"
+            "<h1>502 Bad Gateway</h1>\n</body>\n</html>, url: https://api.example/v1",
+            "unavailable",
+        ),
+        (
+            "ERROR: Policy-restricted capacity is unavailable. Please try again later.",
+            "at_capacity",
+        ),
+        ("ERROR: Flex capacity unavailable.", "at_capacity"),
+        ("ERROR: unexpected status 401 Unauthorized: bad key", None),
+    ],
+)
+def test_codex_provider_errors_are_recognized_from_the_terminal_error(error, kind):
+    from rsi_harness.integrations.rsi_loop import _codex_provider_error
+
+    assert _codex_provider_error(provider_result(error).output) == kind
+    # Only the terminal error counts, not a mention before a later one.
+    assert _codex_provider_error(HEADER + error + "\nERROR: HTTP 401\n") is None
+
+
+@pytest.mark.parametrize(
+    "after",
+    ["\n" + "x" * 2000 + "\nthread 'main' panicked", "\nERROR: HTTP 401\nsee the log"],
+)
+def test_an_earlier_server_error_mention_does_not_count(after):
+    from rsi_harness.integrations.rsi_loop import _codex_provider_error
+
+    mention = HEADER + "ERROR: unexpected status 503 Service Unavailable: down"
+    assert _codex_provider_error(mention + after + "\n") is None
+
+
+def test_rate_limits_back_off_exponentially_in_the_same_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, runtime, clock, request = make_adapter(
+        tmp_path,
+        monkeypatch,
+        [provider_result(RATE_LIMITED) for _ in range(3)]
+        + [AgentRunResult(exit_code=0, output="recovered\n")],
+    )
+
+    result = adapter.run(replace(request, timeout_seconds=3600.0))
+
+    assert result.exit_code == 0 and result.provider_error is None
+    assert (result.provider_retries, result.provider_wait_seconds) == (3, 210)
+    commands = [call["command"][-1] for call in runtime.executions[1:]]
+    assert [f"sleep {delay}" in c for c, delay in zip(commands, (30, 60, 120))] == [
+        True
+    ] * 3
+    assert all("codex exec resume" in c and SESSION in c for c in commands)
+    assert "provider rate limited (HTTP 429); retry 3 in 120s" in commands[-1]
+    prompt = runtime.copied_text[PurePosixPath("/tmp/rsi-agent-provider-retry.md")]
+    assert "temporarily rate limiting requests" in prompt
+    assert clock.now == 1000 + 210 + 2 * 4
+
+
+def test_spent_retries_stop_the_agent_on_the_provider_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    adapter, runtime, clock, request = make_adapter(
+        tmp_path, monkeypatch, [provider_result(RATE_LIMITED) for _ in range(7)]
+    )
+
+    result = adapter.run(replace(request, timeout_seconds=7200.0))
+
+    assert len(runtime.executions) == 7
+    assert result.exit_code == 1 and not result.timed_out
+    assert result.provider_error == "rate_limited"
+    assert (result.provider_retries, result.provider_wait_seconds) == (6, 1830)
+    # The rest of the budget stays for a later resume.
+    assert clock.now == 1000 + 1830 + 2 * 7 < 1000 + 7200
+    assert "stops after 6 retries" in caplog.text
+
+
+def test_a_budget_shorter_than_the_next_wait_stops_without_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, runtime, clock, request = make_adapter(
+        tmp_path, monkeypatch, [provider_result(RATE_LIMITED) for _ in range(3)]
+    )
+
+    result = adapter.run(replace(request, timeout_seconds=80.0))
+
+    # 30 s, then 46 s are left for the next 60 s wait: two execs, one wait.
+    assert len(runtime.executions) == 2
+    assert result.provider_error == "rate_limited" and not result.timed_out
+    assert (result.provider_retries, result.provider_wait_seconds) == (1, 30)
+    assert clock.now == 1000 + 30 + 2 * 2
+
+
+def test_a_long_healthy_session_starts_the_backoff_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, runtime, _, request = make_adapter(
+        tmp_path,
+        monkeypatch,
+        [provider_result(RATE_LIMITED) for _ in range(3)]
+        + [AgentRunResult(exit_code=0)],
+    )
+    # The second session works 20 minutes before it is rate limited again.
+    runtime.work_seconds = [2.0, 1200.0, 2.0, 2.0]
+
+    adapter.run(replace(request, timeout_seconds=7200.0))
+
+    delays = [
+        float(re.search(r"\bsleep\s+([0-9.]+)", call["command"][-1]).group(1))
+        for call in runtime.executions[1:]
+    ]
+    assert delays == [30, 30, 60]
+
+
+def test_other_failures_record_no_provider_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, _, _, request = make_adapter(
+        tmp_path, monkeypatch, [provider_result("ERROR: HTTP 401 Unauthorized")]
+    )
+
+    result = adapter.run(request)
+
+    assert result.exit_code == 1
+    assert (result.provider_error, result.provider_retries) == (None, 0)
+
+
+def test_cancel_during_a_rate_limit_wait_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, runtime, _, request = make_adapter(
+        tmp_path, monkeypatch, [provider_result(RATE_LIMITED), KeyboardInterrupt()]
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        adapter.run(request)
+
+    assert len(runtime.executions) == 2
+    assert "sleep 30" in runtime.executions[1]["command"][-1]

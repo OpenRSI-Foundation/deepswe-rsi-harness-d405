@@ -1,0 +1,808 @@
+"""Strict, portable cluster profile loading."""
+
+from __future__ import annotations
+
+import os
+import re
+import tomllib
+from collections.abc import Mapping
+from importlib import resources
+from pathlib import Path, PurePosixPath
+from typing import Any, Literal, Self
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+from rsi_harness.cluster import podman_bundle
+from rsi_harness.errors import SetupError
+from rsi_harness.models import (
+    JUDGE_ALLOW_MISSING_LANDLOCK_SIGNAL_ENV,
+    JUDGE_ISOLATION_FALLBACK_ENV,
+)
+
+_ENV_REFERENCE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+_SCHEDULER_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
+
+
+class _ProfileModel(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class SchedulerProfile(_ProfileModel):
+    kind: Literal["lsf"]
+    submit_binary: str = "bsub"
+    status_binary: str = "bjobs"
+    cancel_binary: str = "bkill"
+    remote_binary: str = "blaunch"
+    remote_host_flag: str = "-z"
+    remote_args: tuple[str, ...] = ()
+    queue: str
+    group: str
+    exclusive: bool = True
+    excluded_hosts: tuple[str, ...] = ()
+    poll_seconds: float = Field(default=10.0, gt=0.0)
+
+    @property
+    def whole_node(self) -> bool:
+        """Whether a one-host job may hold more GPUs than it asked for."""
+        return False
+
+    @field_validator(
+        "submit_binary",
+        "status_binary",
+        "cancel_binary",
+        "remote_binary",
+        "remote_host_flag",
+    )
+    @classmethod
+    def _nonempty_binary_argument(cls, value: str) -> str:
+        if not value or "\0" in value:
+            raise ValueError("scheduler command values must be non-empty")
+        return value
+
+    @field_validator("remote_args")
+    @classmethod
+    def _safe_remote_args(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not item or "\0" in item for item in value):
+            raise ValueError("scheduler remote_args must be non-empty arguments")
+        return value
+
+    @field_validator("excluded_hosts")
+    @classmethod
+    def _safe_excluded_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("scheduler excluded_hosts contains a duplicate")
+        if any(_SCHEDULER_HOST.fullmatch(host) is None for host in value):
+            raise ValueError("scheduler excluded_hosts contains an unsafe host")
+        return value
+
+
+def _walltime_limit(value: str | None) -> str | None:
+    if value is not None and (
+        re.fullmatch(r"\d+:[0-5]\d", value) is None or not int(value.replace(":", ""))
+    ):
+        raise ValueError("run_walltime_limit must be positive HH:MM")
+    return value
+
+
+class SlurmBuildProfile(_ProfileModel):
+    """Scheduling overrides for image construction, never Work or Judge."""
+
+    partition: str | None = None
+    account: str | None = None
+    qos: str | None = None
+    constraint: str | None = None
+    gpus: int = Field(default=0, ge=0)
+    exclusive: bool = False
+
+
+class SlurmSchedulerProfile(SchedulerProfile):
+    kind: Literal["slurm"]
+    submit_binary: str = "sbatch"
+    status_binary: str = "squeue"
+    cancel_binary: str = "scancel"
+    accounting_binary: str = "sacct"
+    control_binary: str = "scontrol"
+    remote_binary: str = "srun"
+    remote_host_flag: str = "--nodelist"
+    # Controllers and cleanup steps must coexist with their rank workers.
+    remote_args: tuple[str, ...] = (
+        "--overlap",
+        "--exact",
+        "--nodes=1",
+        "--ntasks=1",
+        "--cpu-bind=none",
+        "--export=ALL",
+    )
+    queue: str = Field(validation_alias=AliasChoices("partition", "queue"))
+    group: str = Field(default="", validation_alias=AliasChoices("account", "group"))
+    qos: str | None = None
+    constraint: str | None = None
+    request_tmp: bool = True
+    build: SlurmBuildProfile | None = None
+    # Total research time stays in the task/lease; this limits each allocation.
+    run_walltime_limit: str | None = None
+    # How GPUs are requested: --gres=gpu:N, or --gpus=N (--gpus-per-node=N on
+    # several hosts) at sites that document only the latter.
+    gpu_option: Literal["gres", "gpus"] = "gres"
+
+    @field_validator("run_walltime_limit")
+    @classmethod
+    def _run_walltime_limit(cls, value: str | None) -> str | None:
+        return _walltime_limit(value)
+
+    @field_validator("accounting_binary", "control_binary")
+    @classmethod
+    def _nonempty_slurm_binary(cls, value: str) -> str:
+        return cls._nonempty_binary_argument(value)
+
+
+_BATCH_RESOURCE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*=[A-Za-z0-9_.:+-]+$")
+
+
+def _batch_resources(value: tuple[str, ...]) -> tuple[str, ...]:
+    if any(_BATCH_RESOURCE.fullmatch(item) is None for item in value):
+        raise ValueError("scheduler resources must be NAME=VALUE")
+    names = [item.split("=", 1)[0] for item in value]
+    if len(names) != len(set(names)):
+        raise ValueError("scheduler resources must be named once")
+    return value
+
+
+class BatchCapacity(_ProfileModel):
+    """CPU/RAM supplied by a fixed-size queue allocation, in cores and MiB."""
+
+    cpu_slots: int = Field(gt=0)
+    memory_mb: int = Field(gt=0)
+    per_gpu: bool = False
+
+
+class PBSBuildProfile(_ProfileModel):
+    """Scheduling overrides for image construction, never Work or Judge."""
+
+    queue: str | None = None
+    account: str | None = None
+    project: str | None = None
+    # The build queue's own select chunk, where it differs from the runs'.
+    chunk_resources: tuple[Literal["ncpus", "mem", "ngpus"], ...] | None = None
+    gpus: int = Field(default=0, ge=0)
+    exclusive: bool = False
+    capacity: BatchCapacity | None = None
+
+
+class PBSSchedulerProfile(SchedulerProfile):
+    """PBS Pro: each build and run job is one PBS job on one host."""
+
+    kind: Literal["pbs"]
+    submit_binary: str = "qsub"
+    status_binary: str = "qstat"
+    cancel_binary: str = "qdel"
+    select_binary: str = "qselect"
+    group: str = Field(default="", validation_alias=AliasChoices("account", "group"))
+    project: str | None = None
+    # The planned resources the select chunk names; a queue that hands out
+    # whole nodes or fixed shares may take fewer ("select=1" alone). A job
+    # whose chunk names no ngpus, or an exclusive one, may get all the
+    # node's GPUs: the Engine uses the planned number, lowest index first.
+    chunk_resources: tuple[Literal["ncpus", "mem", "ngpus"], ...] = (
+        "ncpus",
+        "mem",
+        "ngpus",
+    )
+    # Site resources added to the chunk as given, such as "host_type=gpu".
+    chunk_extra: tuple[str, ...] = ()
+    build: PBSBuildProfile | None = None
+    run_walltime_limit: str | None = None
+    capacity: BatchCapacity | None = None
+    # "allocation": build and run jobs run inside the controller's own job
+    # (schedulers/allocation.py), which may hold more GPUs than planned.
+    launch: Literal["submit", "allocation"] = "submit"
+
+    @field_validator("run_walltime_limit")
+    @classmethod
+    def _run_walltime_limit(cls, value: str | None) -> str | None:
+        return _walltime_limit(value)
+
+    @property
+    def whole_node(self) -> bool:
+        return (
+            self.launch == "allocation"
+            or self.exclusive
+            or "ngpus" not in self.chunk_resources
+        )
+
+    @field_validator("select_binary")
+    @classmethod
+    def _nonempty_pbs_binary(cls, value: str) -> str:
+        return cls._nonempty_binary_argument(value)
+
+    @field_validator("chunk_extra")
+    @classmethod
+    def _safe_chunk_extra(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _batch_resources(value)
+
+    @field_validator("excluded_hosts")
+    @classmethod
+    def _no_excluded_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if value:
+            raise ValueError("PBS jobs cannot exclude hosts")
+        return value
+
+
+class PJMBuildProfile(_ProfileModel):
+    """Scheduling overrides for image construction, never Work or Judge."""
+
+    resource_group: str | None = None
+    group: str | None = None
+    gpus: int = Field(default=0, ge=0)
+    exclusive: bool = False
+    capacity: BatchCapacity | None = None
+
+
+class PJMSchedulerProfile(SchedulerProfile):
+    """Fujitsu Technical Computing Suite (pjsub): each build and run job is
+    one job on one node."""
+
+    kind: Literal["pjm"]
+    submit_binary: str = "pjsub"
+    status_binary: str = "pjstat"
+    cancel_binary: str = "pjdel"
+    queue: str = Field(validation_alias=AliasChoices("resource_group", "queue"))
+    group: str = ""
+    # How a job asks for its GPUs (gpu=N); for a job without GPUs, its CPU
+    # cores (vnode-core=N) and memory (vnode-mem=<MiB>Mi) where the resource
+    # group needs them. A gpu=N job gets the node's share for N GPUs. An
+    # exclusive job asks for a whole node (node=1) instead and gets all its
+    # GPUs: the Engine uses the planned number, lowest index first.
+    gpu_resource: str | None = "gpu"
+    cpu_resource: str | None = None
+    memory_resource: str | None = None
+    # Site resources added as given, such as "jobenv=singularity".
+    resources: tuple[str, ...] = ()
+    build: PJMBuildProfile | None = None
+    run_walltime_limit: str | None = None
+    capacity: BatchCapacity | None = None
+    # As for PBS.
+    launch: Literal["submit", "allocation"] = "submit"
+
+    @field_validator("run_walltime_limit")
+    @classmethod
+    def _run_walltime_limit(cls, value: str | None) -> str | None:
+        return _walltime_limit(value)
+
+    @property
+    def whole_node(self) -> bool:
+        return (
+            self.launch == "allocation" or self.exclusive or self.gpu_resource is None
+        )
+
+    @field_validator("resources")
+    @classmethod
+    def _safe_resources(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _batch_resources(value)
+
+    @field_validator("gpu_resource", "cpu_resource", "memory_resource")
+    @classmethod
+    def _resource_name(cls, value: str | None) -> str | None:
+        if (
+            value is not None
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", value) is None
+        ):
+            raise ValueError("PJM resource names must be plain names")
+        return value
+
+    @field_validator("excluded_hosts")
+    @classmethod
+    def _no_excluded_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if value:
+            raise ValueError("PJM jobs cannot exclude hosts")
+        return value
+
+
+_KUBERNETES_NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+class KubernetesVolumeProfile(_ProfileModel):
+    """One Pod volume. Shared storage is mounted at its own path, so the
+    paths the submit host writes are the paths the Pod reads."""
+
+    path: PurePosixPath
+    host_path: PurePosixPath | None = None
+    claim: str | None = None
+    sub_path: str | None = None
+    nfs_server: str | None = None
+    nfs_path: PurePosixPath | None = None
+    # Node-local scratch (an emptyDir), for example the Apptainer temp root.
+    empty_dir: bool = False
+    read_only: bool = False
+
+    @field_validator("path", "host_path", "nfs_path")
+    @classmethod
+    def _absolute(cls, value: PurePosixPath | None) -> PurePosixPath | None:
+        if value is not None and (
+            not value.is_absolute() or value == PurePosixPath("/")
+        ):
+            raise ValueError("Kubernetes volume paths must be absolute, not /")
+        return value
+
+    @model_validator(mode="after")
+    def _one_source(self) -> Self:
+        sources = (
+            self.host_path is not None,
+            self.claim is not None,
+            self.nfs_server is not None or self.nfs_path is not None,
+            self.empty_dir,
+        )
+        if sum(sources) != 1:
+            raise ValueError(
+                "a Kubernetes volume needs exactly one of host_path, claim, "
+                "nfs_server/nfs_path or empty_dir"
+            )
+        if (self.nfs_server is None) != (self.nfs_path is None):
+            raise ValueError("nfs_server and nfs_path must be set together")
+        if self.sub_path is not None and self.claim is None:
+            raise ValueError("sub_path applies to a claim")
+        return self
+
+    @property
+    def shared(self) -> bool:
+        """Whether files under ``path`` are the submit host's files."""
+        return not self.empty_dir
+
+
+class KubernetesBuildProfile(_ProfileModel):
+    """Scheduling overrides for image construction, never Work or Judge."""
+
+    image: str | None = None
+    node_selector: dict[str, str] | None = None
+    tolerations: tuple[dict[str, Any], ...] | None = None
+    gpus: int = Field(default=0, ge=0)
+
+
+class KubernetesSchedulerProfile(_ProfileModel):
+    """Run each build and run job as a Kubernetes Job of one Pod, which plays
+    the part of a single-node allocation: the Engine inside it runs Work and
+    Judge with Apptainer, as on LSF and Slurm."""
+
+    kind: Literal["kubernetes"]
+    kubectl: str = "kubectl"
+    kubeconfig: Path | None = None
+    context: str | None = None
+    namespace: str
+    # Carries bash, coreutils, util-linux, tzdata and non-setuid Apptainer.
+    image: str
+    image_pull_policy: Literal["Always", "IfNotPresent", "Never"] = "IfNotPresent"
+    image_pull_secrets: tuple[str, ...] = ()
+    # Path prefixes the image itself provides at the submit host's paths
+    # (for example the Harness virtualenv), so no volume needs to carry them.
+    image_paths: tuple[PurePosixPath, ...] = ()
+    volumes: tuple[KubernetesVolumeProfile, ...] = ()
+    # Apptainer and rsi-box need user namespaces and an unmasked /proc:
+    # "privileged" Pods, or "userns" Pods (hostUsers: false, procMount
+    # Unmasked, unconfined seccomp and AppArmor) where the cluster allows them.
+    pod_security: Literal["privileged", "userns"]
+    # Privileged Pods see every host device unless the container runtime
+    # hides them (privileged_without_host_devices): "host" refuses GPU jobs.
+    privileged_devices: Literal["host", "allocated"] = "host"
+    # A Localhost AppArmor profile, loaded on the nodes, that allows user
+    # namespaces where kernel.apparmor_restrict_unprivileged_userns=1.
+    apparmor_profile: str | None = None
+    # Pods run as the submitting user's uid and gid (the run directory is
+    # theirs), never as root.
+    service_account: str | None = None
+    priority_class: str | None = None
+    # A RuntimeClass, for example "nvidia" where GPU Pods need the NVIDIA
+    # runtime that is not the node's default.
+    runtime_class: str | None = None
+    node_selector: dict[str, str] = Field(default_factory=dict)
+    tolerations: tuple[dict[str, Any], ...] = ()
+    excluded_hosts: tuple[str, ...] = ()
+    gpu_resource: str = "nvidia.com/gpu"
+    # Request node-local disk (ephemeral-storage) for the job's scratch.
+    request_tmp: bool = True
+    environment: dict[str, str] = Field(default_factory=dict)
+    labels: dict[str, str] = Field(default_factory=dict)
+    # The Harness reads a finished Job's end; resume and publication need it.
+    ttl_seconds_after_finished: int | None = Field(default=604800, ge=3600)
+    poll_seconds: float = Field(default=10.0, gt=0.0)
+    build: KubernetesBuildProfile | None = None
+    # Total research time stays in the task/lease; this limits each Pod.
+    run_walltime_limit: str | None = None
+    # Kubernetes has no exclusive-node request; use node_selector/tolerations.
+    exclusive: Literal[False] = False
+
+    @property
+    def queue(self) -> str:
+        return self.namespace
+
+    @property
+    def whole_node(self) -> bool:
+        return False
+
+    @property
+    def group(self) -> str:
+        return ""
+
+    @field_validator("kubectl")
+    @classmethod
+    def _nonempty_binary(cls, value: str) -> str:
+        if not value or "\0" in value:
+            raise ValueError("scheduler kubectl must be non-empty")
+        return value
+
+    @field_validator("kubeconfig")
+    @classmethod
+    def _absolute_kubeconfig(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("scheduler kubeconfig must be an absolute path")
+        return value
+
+    @field_validator("namespace")
+    @classmethod
+    def _namespace(cls, value: str) -> str:
+        if _KUBERNETES_NAME.fullmatch(value) is None:
+            raise ValueError("scheduler namespace must be a DNS-1123 label")
+        return value
+
+    @field_validator("image_paths")
+    @classmethod
+    def _absolute_image_paths(
+        cls, value: tuple[PurePosixPath, ...]
+    ) -> tuple[PurePosixPath, ...]:
+        if any(not path.is_absolute() for path in value):
+            raise ValueError("scheduler image_paths must be absolute")
+        return value
+
+    @field_validator("excluded_hosts")
+    @classmethod
+    def _safe_excluded_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("scheduler excluded_hosts contains a duplicate")
+        if any(_SCHEDULER_HOST.fullmatch(host) is None for host in value):
+            raise ValueError("scheduler excluded_hosts contains an unsafe host")
+        return value
+
+    @field_validator("run_walltime_limit")
+    @classmethod
+    def _run_walltime_limit(cls, value: str | None) -> str | None:
+        return _walltime_limit(value)
+
+    @model_validator(mode="after")
+    def _distinct_mounts(self) -> Self:
+        paths = [volume.path for volume in self.volumes]
+        if len(paths) != len(set(paths)):
+            raise ValueError("scheduler volumes mount two volumes at one path")
+        return self
+
+
+class StorageProfile(_ProfileModel):
+    run_root: Path
+    image_cache: Path
+    logs_root: Path
+    hf_home: Path
+    hf_datasets_cache: Path
+
+    @field_validator(
+        "run_root", "image_cache", "logs_root", "hf_home", "hf_datasets_cache"
+    )
+    @classmethod
+    def _absolute(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("cluster storage paths must be absolute")
+        return value
+
+
+class BuilderProfile(_ProfileModel):
+    binary: Path
+    cpu_slots: int = Field(gt=0)
+    memory_mb: int = Field(gt=0)
+    walltime: str
+    temp_root: Path = Path("/tmp")
+    min_tmp_mb: int = Field(gt=0)
+    rootless_apt_sandbox: bool = False
+    faked_binary: Path | None = None
+    fakeroot_library: Path | None = None
+    # Explicit helpers for a Podman whose own lookup does not find them.
+    conmon: Path | None = None
+    runtime: Path | None = None
+    # Shared directory the Harness installs its static Podman bundle into;
+    # it then supplies binary, conmon and runtime.
+    podman_bundle: Path | None = None
+    # "vfs" where rootless overlay is unavailable (old kernel, no
+    # fuse-overlayfs).
+    storage_driver: Literal["overlay", "vfs"] = "overlay"
+    # Host namespaces build RUN steps share, on nodes that cannot create
+    # their own (max_net_namespaces or max_uts_namespaces is 0).
+    host_namespaces: tuple[Literal["network", "uts"], ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _bundle_tools(cls, data: Any) -> Any:
+        if not isinstance(data, Mapping) or data.get("podman_bundle") is None:
+            return data
+        tree = podman_bundle.bundle_dir(Path(data["podman_bundle"]))
+        data = dict(data)
+        for key, relative in (
+            ("binary", podman_bundle.PODMAN),
+            ("conmon", podman_bundle.CONMON),
+            ("runtime", podman_bundle.RUNTIME),
+        ):
+            if data.get(key) is not None and Path(data[key]) != tree / relative:
+                raise ValueError(f"builder {key} comes from podman_bundle; remove it")
+            # A string, so JSON validation (an Engine payload) accepts it too.
+            data[key] = str(tree / relative)
+        return data
+
+    @field_validator("conmon", "runtime", "podman_bundle")
+    @classmethod
+    def _absolute_helper(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError(
+                "builder conmon, runtime and podman_bundle must be absolute paths"
+            )
+        return value
+
+    @field_validator("host_namespaces")
+    @classmethod
+    def _unique_namespaces(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("builder host_namespaces contains a duplicate")
+        return value
+
+    @model_validator(mode="after")
+    def _paired_fakeroot_tools(self) -> Self:
+        if (self.faked_binary is None) != (self.fakeroot_library is None):
+            raise ValueError(
+                "builder faked_binary and fakeroot_library must be set together"
+            )
+        return self
+
+
+class ApptainerBindProfile(_ProfileModel):
+    """One site-owned bind, scoped to a single execution phase."""
+
+    source: Path
+    target: PurePosixPath
+    read_only: bool = True
+
+    @field_validator("source")
+    @classmethod
+    def _absolute_source(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("Apptainer bind sources must be absolute")
+        return value
+
+    @field_validator("target")
+    @classmethod
+    def _absolute_target(cls, value: PurePosixPath) -> PurePosixPath:
+        if (
+            not value.is_absolute()
+            or value == PurePosixPath("/")
+            or ".." in value.parts
+        ):
+            raise ValueError("Apptainer bind targets must be absolute non-root paths")
+        return value
+
+
+class ApptainerProfile(_ProfileModel):
+    binary: Path
+    dns_bind: Path = Path("/etc/resolv.conf")
+    # Existing site profiles retain their mount behavior unless they opt in.
+    mount_policy: Literal["legacy", "scoped"] = "legacy"
+    extra_binds: tuple[Path, ...] = ()
+    work_binds: tuple[ApptainerBindProfile, ...] = ()
+    judge_binds: tuple[ApptainerBindProfile, ...] = ()
+    # Optional site-owned root. A task-specific child, when present, is bound
+    # read-only at /run-contract for Judge only.
+    judge_authority_root: Path | None = None
+    build_args: tuple[str, ...] = ()
+    workspace_target: PurePosixPath = PurePosixPath("/testbed")
+    temp_root: Path = Path("/tmp")
+    container_python: PurePosixPath = PurePosixPath("/usr/bin/python3")
+    rdma_binds: tuple[Path, ...] = ()
+    environment: dict[str, str] = Field(default_factory=dict)
+    work_environment: dict[str, str] = Field(default_factory=dict)
+    judge_environment: dict[str, str] = Field(default_factory=dict)
+    # The operator's choice for a Judge that is neither root nor able to use
+    # Landlock (a kernel without it): "none" fails such a round closed;
+    # "same-user" runs its routes and Agent calls as the Judge's own user,
+    # without filesystem confinement. Never a task setting.
+    judge_isolation_fallback: Literal["none", "same-user"] = "none"
+    # Explicit operator consent to the ABI 6 backport missing signal scoping.
+    # Filesystem rights and abstract-socket scoping remain mandatory.
+    judge_allow_missing_landlock_signal: bool = Field(default=False, strict=True)
+    # How a "no-network" phase is isolated: its own network namespace, or
+    # (sites without one) a seccomp filter with no IP sockets at all. Never
+    # a task setting.
+    network_isolation: Literal["namespace", "seccomp"] = "namespace"
+    # Who gives Work and Judge their own PID and IPC namespaces: Apptainer
+    # (--containall where the site allows them), or a Harness helper inside
+    # the container where the site's apptainer.conf disables them. Never a
+    # task setting.
+    process_namespaces: Literal["apptainer", "harness"] = "apptainer"
+
+    @field_validator("binary")
+    @classmethod
+    def _absolute_binary(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("apptainer.binary must be an absolute compute-node path")
+        return value
+
+    @field_validator("environment", "work_environment", "judge_environment")
+    @classmethod
+    def _runtime_environment(cls, value: dict[str, str]) -> dict[str, str]:
+        for name, item in value.items():
+            if re.fullmatch(r"[A-Z_][A-Z0-9_]*", name) is None:
+                raise ValueError(f"Apptainer environment name is invalid: {name!r}")
+            if name == JUDGE_ISOLATION_FALLBACK_ENV:
+                raise ValueError(
+                    f"{name} comes from judge_isolation_fallback, not an "
+                    "Apptainer environment table"
+                )
+            if name == JUDGE_ALLOW_MISSING_LANDLOCK_SIGNAL_ENV:
+                raise ValueError(
+                    f"{name} comes from judge_allow_missing_landlock_signal, "
+                    "not an Apptainer environment table"
+                )
+            if "\0" in item:
+                raise ValueError(f"Apptainer environment value contains NUL: {name}")
+        return value
+
+    @field_validator("workspace_target", "container_python")
+    @classmethod
+    def _container_path(cls, value: PurePosixPath) -> PurePosixPath:
+        if (
+            not value.is_absolute()
+            or value == PurePosixPath("/")
+            or ".." in value.parts
+        ):
+            raise ValueError(
+                "Apptainer container paths must be absolute non-root paths"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _scoped_binds_only(self) -> Self:
+        if self.mount_policy == "scoped" and self.extra_binds:
+            raise ValueError(
+                "scoped mount policy forbids extra_binds; use work_binds and "
+                "judge_binds with explicit targets and read_only settings"
+            )
+        return self
+
+    @field_validator("extra_binds", "rdma_binds")
+    @classmethod
+    def _absolute_host_binds(cls, value: tuple[Path, ...]) -> tuple[Path, ...]:
+        if any(not path.is_absolute() for path in value):
+            raise ValueError("Apptainer host bind paths must be absolute")
+        return value
+
+    @field_validator("judge_authority_root")
+    @classmethod
+    def _absolute_authority_root(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("Judge authority root must be absolute")
+        return value
+
+
+class ResourceProfile(_ProfileModel):
+    min_cpu_slots: int = Field(gt=0)
+    min_memory_mb: int = Field(gt=0)
+    min_runtime_tmp_mb: int = Field(default=0, ge=0)
+    gpus_per_node: int = Field(gt=0)
+    walltime_margin_seconds: int = Field(ge=0)
+    all_gpus_override: int | None = Field(default=None, gt=0)
+    # The compute nodes' architecture, where a submit host's may differ: the
+    # Engine runs there with the controller's Python, so a controller on
+    # another architecture is refused before any job is submitted.
+    node_machine: Literal["x86_64", "aarch64"] | None = None
+    # A variable the scheduler sets in each job to its node-local scratch
+    # (PJM_SSD_DIR, for example): where it is set, jobs use it instead of the
+    # builder's and Apptainer's temp_root.
+    node_tmp_variable: str | None = None
+
+    @field_validator("node_tmp_variable")
+    @classmethod
+    def _variable_name(cls, value: str | None) -> str | None:
+        if value is not None and re.fullmatch(r"[A-Z_][A-Z0-9_]*", value) is None:
+            raise ValueError("node_tmp_variable must be an environment variable name")
+        return value
+
+
+class ClusterProfile(_ProfileModel):
+    name: str
+    adapter: Literal["bluevela", "slurm", "kubernetes", "pbs", "pjm"]
+    owner: str
+    scheduler: (
+        SchedulerProfile
+        | SlurmSchedulerProfile
+        | KubernetesSchedulerProfile
+        | PBSSchedulerProfile
+        | PJMSchedulerProfile
+    ) = Field(discriminator="kind")
+    storage: StorageProfile
+    builder: BuilderProfile
+    apptainer: ApptainerProfile
+    resources: ResourceProfile
+
+    @model_validator(mode="after")
+    def _matching_scheduler(self) -> Self:
+        expected = {"bluevela": "lsf"}.get(self.adapter, self.adapter)
+        if self.scheduler.kind != expected:
+            raise ValueError(f"{self.adapter} adapter requires {expected} scheduler")
+        return self
+
+
+def _expand(value: Any, environ: Mapping[str, str]) -> Any:
+    if isinstance(value, str):
+
+        def replace(match: re.Match[str]) -> str:
+            name = match.group(1)
+            if name not in environ:
+                raise SetupError(
+                    f"cluster profile references missing environment variable {name}"
+                )
+            return environ[name]
+
+        return _ENV_REFERENCE.sub(replace, value)
+    if isinstance(value, list):
+        return [_expand(item, environ) for item in value]
+    if isinstance(value, dict):
+        return {key: _expand(item, environ) for key, item in value.items()}
+    return value
+
+
+# Packaged profiles by name: portable examples, and site profiles.
+_PACKAGED_PROFILES = {
+    "bluevela": ("rsi_harness.cluster.bluevela", "profile.toml"),
+    "slurm": ("rsi_harness.cluster.slurm", "profile.toml"),
+    "sherlock": ("rsi_harness.cluster.slurm", "sherlock.toml"),
+    "kubernetes": ("rsi_harness.cluster.kubernetes", "profile.toml"),
+    "pbs": ("rsi_harness.cluster.pbs", "profile.toml"),
+    "flow2": ("rsi_harness.cluster.pbs", "flow2.toml"),
+    "flow2-node": ("rsi_harness.cluster.pbs", "flow2-node.toml"),
+    "pjm": ("rsi_harness.cluster.pjm", "profile.toml"),
+    "genkai": ("rsi_harness.cluster.pjm", "genkai.toml"),
+}
+
+
+def resolve_cluster_profile_path(name_or_path: str | Path) -> Path:
+    """Resolve the exact profile file, also for callers recording its digest.
+
+    Site names belong to the selected Harness's registry; consumers need not
+    keep their own list of packaged profiles.
+    """
+    candidate = Path(name_or_path).expanduser()
+    if candidate.is_file():
+        return candidate.resolve()
+    packaged = _PACKAGED_PROFILES.get(str(name_or_path))
+    if packaged is not None:
+        package, filename = packaged
+        return Path(str(resources.files(package).joinpath(filename))).resolve()
+    raise SetupError(f"unknown cluster or profile path: {name_or_path}")
+
+
+def _profile_bytes(name_or_path: str | Path) -> bytes:
+    return resolve_cluster_profile_path(name_or_path).read_bytes()
+
+
+def load_cluster_profile(
+    name_or_path: str | Path,
+    environ: Mapping[str, str] | None = None,
+) -> ClusterProfile:
+    """Load a packaged cluster name or an explicit TOML profile."""
+    try:
+        raw = tomllib.loads(_profile_bytes(name_or_path).decode("utf-8"))
+        expanded = _expand(raw, os.environ if environ is None else environ)
+        return ClusterProfile.model_validate(expanded)
+    except SetupError:
+        raise
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError, ValidationError) as error:
+        raise SetupError(f"invalid cluster profile {name_or_path}: {error}") from error

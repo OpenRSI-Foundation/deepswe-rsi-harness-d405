@@ -1,0 +1,365 @@
+"""Synchronous Spectrum LSF job submission."""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import time
+from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
+from typing import Self
+
+from pydantic import Field, field_validator, model_validator
+
+from rsi_harness.errors import InfrastructureError, SetupError
+from rsi_harness.models import PersistedModel
+
+_JOB_ID = re.compile(r"^Job <([0-9]+)> is submitted", re.MULTILINE)
+_SAFE_JOB_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_SAFE_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
+_TERMINAL_STATES = {"DONE", "EXIT"}
+_TRANSIENT_STATUS_ERRORS = ("communication time out",)
+# bhist -l's line for a job's end: "Tue Oct 21 18:30:12: Exited with exit code
+# 140. ...", "...: Done successfully. ..." or "...: Completed <exit>; ...".
+_HISTORY_END = re.compile(
+    r"^\s*(?:[A-Z][a-z]{2} )?([A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2}(?: \d{4})?): "
+    r"(?:Done successfully|Exited|Completed <(?:done|exit)>)",
+    re.MULTILINE,
+)
+
+CommandRunner = Callable[[tuple[str, ...]], subprocess.CompletedProcess[str]]
+
+
+def _run(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, check=False, capture_output=True, text=True)
+
+
+def _finish_time(fields: list[str]) -> float | None:
+    """An LSF time ("Oct 21 18:30" from bjobs' ``finish_time``, with its
+    seconds from bhist, the year when LSB_DISPLAY_YEAR is set, and bjobs'
+    trailing flag letter), as an epoch; a time in minutes to the end of its
+    minute, so an attempt is never charged short."""
+    if fields and len(fields[-1]) == 1 and fields[-1].isalpha():
+        fields = fields[:-1]
+    value = " ".join(fields)
+    now = datetime.now()
+    for layout in (
+        "%b %d %H:%M:%S %Y",
+        "%b %d %H:%M %Y",
+        "%b %d %H:%M:%S",
+        "%b %d %H:%M",
+    ):
+        try:
+            # The year first: Feb 29 parses only with its own year.
+            parsed = datetime.strptime(
+                value if "%Y" in layout else f"{value} {now.year}",
+                layout if "%Y" in layout else f"{layout} %Y",
+            )
+        except ValueError:
+            continue
+        if "%Y" not in layout and parsed > now:
+            parsed = parsed.replace(year=now.year - 1)
+        return parsed.timestamp() + (0 if "%S" in layout else 59)
+    return None
+
+
+class LSFJobSpec(PersistedModel):
+    name: str
+    queue: str
+    group: str
+    cpu_slots: int = Field(gt=0)
+    memory_mb: int = Field(gt=0)
+    walltime: str
+    stdout_path: Path
+    stderr_path: Path
+    script_path: Path
+    gpu_count: int = Field(default=0, ge=0)
+    local_tmp_mb: int = Field(default=0, ge=0)
+    one_host: bool = True
+    hosts: int = Field(default=1, gt=0)
+    slots_per_host: int | None = Field(default=None, gt=0)
+    memory_per_host: bool = False
+    exclusive: bool = False
+    excluded_hosts: tuple[str, ...] = ()
+
+    @field_validator("name")
+    @classmethod
+    def _safe_name(cls, value: str) -> str:
+        if not _SAFE_JOB_NAME.fullmatch(value):
+            raise ValueError("LSF job name contains unsupported characters")
+        return value
+
+    @field_validator("stdout_path", "stderr_path", "script_path")
+    @classmethod
+    def _absolute_path(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("LSF paths must be absolute")
+        return value
+
+    @field_validator("excluded_hosts")
+    @classmethod
+    def _safe_excluded_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("excluded_hosts contains a duplicate")
+        if any(_SAFE_HOST.fullmatch(host) is None for host in value):
+            raise ValueError("excluded_hosts contains an unsafe host")
+        return value
+
+    @model_validator(mode="after")
+    def _host_shape(self) -> Self:
+        if self.one_host:
+            if self.hosts != 1 or self.slots_per_host is not None:
+                raise ValueError(
+                    "one-host LSF specs require hosts=1 without slots_per_host"
+                )
+            if self.memory_per_host:
+                raise ValueError("per-host memory requires a multi-host LSF spec")
+            return self
+        if self.hosts <= 1 or self.slots_per_host is None:
+            raise ValueError("multi-host LSF specs require hosts>1 and slots_per_host")
+        if self.cpu_slots != self.hosts * self.slots_per_host:
+            raise ValueError("multi-host cpu_slots must equal hosts * slots_per_host")
+        return self
+
+
+class LSFJobResult(PersistedModel):
+    job_id: str
+    state: str
+    exit_code: int
+    # When the job ended, if the scheduler still records it (``finished``).
+    ended_at: float | None = None
+
+
+class LSFScheduler:
+    def __init__(
+        self,
+        *,
+        submit_binary: str = "bsub",
+        status_binary: str = "bjobs",
+        cancel_binary: str = "bkill",
+        history_binary: str = "bhist",
+        runner: CommandRunner = _run,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._submit_binary = submit_binary
+        self._status_binary = status_binary
+        self._cancel_binary = cancel_binary
+        self._history_binary = history_binary
+        self._runner = runner
+        self._sleeper = sleeper
+
+    def render_submit(self, spec: LSFJobSpec) -> tuple[str, ...]:
+        argv = [
+            self._submit_binary,
+            "-J",
+            spec.name,
+            "-G",
+            spec.group,
+            "-q",
+            spec.queue,
+            "-n",
+            str(spec.cpu_slots),
+            "-M",
+            f"{spec.memory_mb}M",
+            "-W",
+            spec.walltime,
+        ]
+        resource_terms = []
+        select_conditions = []
+        if spec.local_tmp_mb:
+            select_conditions.append(f"tmp>={spec.local_tmp_mb}")
+        select_conditions.extend(f"hname!='{host}'" for host in spec.excluded_hosts)
+        if select_conditions:
+            resource_terms.append(f"select[{' && '.join(select_conditions)}]")
+        if spec.one_host:
+            resource_terms.append("span[hosts=1]")
+        else:
+            assert spec.slots_per_host is not None
+            resource_terms.append(f"span[ptile={spec.slots_per_host}]")
+            if spec.memory_per_host:
+                resource_terms.append(f"rusage[mem={spec.memory_mb}]")
+        if resource_terms:
+            argv.extend(("-R", " ".join(resource_terms)))
+        if spec.gpu_count:
+            # Keep GPUs exclusive to this job, but allow multiple CUDA processes
+            # per GPU (distributed training teardown needs Default compute mode).
+            argv.extend(
+                (
+                    "-gpu",
+                    f"num={spec.gpu_count}:mode=shared:j_exclusive=yes",
+                )
+            )
+        if spec.exclusive:
+            argv.append("-x")
+        argv.extend(
+            (
+                # A site rerun would run the payload over the same run logs.
+                "-rn",
+                "-o",
+                str(spec.stdout_path),
+                "-e",
+                str(spec.stderr_path),
+                str(spec.script_path),
+            )
+        )
+        return tuple(argv)
+
+    def submit(self, spec: LSFJobSpec) -> str:
+        if not spec.script_path.is_file():
+            raise SetupError(f"LSF payload does not exist: {spec.script_path}")
+        completed = self._runner(self.render_submit(spec))
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise InfrastructureError(
+                f"LSF submission failed with exit {completed.returncode}: {detail}"
+            )
+        match = _JOB_ID.search(completed.stdout)
+        if match is None:
+            raise InfrastructureError(
+                "LSF submission succeeded without a parseable exact job ID"
+            )
+        return match.group(1)
+
+    def require_name_available(self, name: str) -> None:
+        """Reject an exact active-name collision on the shared LSF account."""
+        completed = self._runner(
+            (self._status_binary, "-noheader", "-o", "job_name stat")
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise InfrastructureError(f"cannot inspect active LSF jobs: {detail}")
+        active_names = {
+            fields[0]
+            for line in completed.stdout.splitlines()
+            if (fields := line.split())
+        }
+        if name in active_names:
+            raise InfrastructureError(f"LSF job name is already active: {name}")
+
+    def wait(
+        self,
+        job_id: str,
+        *,
+        poll_seconds: float = 5.0,
+        on_state: Callable[[str], None] | None = None,
+    ) -> LSFJobResult:
+        self._require_job_id(job_id)
+        previous_state: str | None = None
+        try:
+            while True:
+                completed = self._runner(
+                    (
+                        self._status_binary,
+                        "-a",
+                        "-noheader",
+                        "-o",
+                        "stat exit_code",
+                        job_id,
+                    )
+                )
+                if completed.returncode != 0:
+                    detail = completed.stderr.strip() or completed.stdout.strip()
+                    if any(
+                        marker in detail.lower() for marker in _TRANSIENT_STATUS_ERRORS
+                    ):
+                        self._sleeper(poll_seconds)
+                        continue
+                    raise InfrastructureError(
+                        f"cannot query LSF job {job_id}: {detail}"
+                    )
+                state, exit_code = self._parse_status(job_id, completed.stdout)
+                if state != previous_state and on_state is not None:
+                    on_state(state)
+                previous_state = state
+                if state in _TERMINAL_STATES:
+                    return LSFJobResult(
+                        job_id=job_id,
+                        state=state,
+                        exit_code=exit_code,
+                    )
+                self._sleeper(poll_seconds)
+        except KeyboardInterrupt:
+            self.cancel(job_id)
+            raise
+
+    def finished(self, job_id: str) -> LSFJobResult | None:
+        """The job's end, or None while LSF still runs or queues it.
+
+        bjobs lists every unfinished job; one it no longer finds has ended
+        and been cleaned from its history, state ``UNKNOWN``, with the end
+        bhist still records, if any.
+        """
+        self._require_job_id(job_id)
+        completed = self._runner(
+            (
+                self._status_binary,
+                "-a",
+                "-noheader",
+                "-o",
+                "stat exit_code finish_time",
+                job_id,
+            )
+        )
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        if "is not found" in detail:
+            return LSFJobResult(
+                job_id=job_id,
+                state="UNKNOWN",
+                exit_code=1,
+                ended_at=self._history_end(job_id),
+            )
+        if completed.returncode != 0:
+            raise InfrastructureError(f"cannot query LSF job {job_id}: {detail}")
+        fields = completed.stdout.split()
+        state, exit_code = self._parse_status(job_id, " ".join(fields[:2]))
+        if state not in _TERMINAL_STATES:
+            return None
+        return LSFJobResult(
+            job_id=job_id,
+            state=state,
+            exit_code=exit_code,
+            ended_at=_finish_time(fields[2:]),
+        )
+
+    def _history_end(self, job_id: str) -> float | None:
+        """The job's last end in every LSF event log, kept long after bjobs
+        forgets the job; None if bhist has none."""
+        completed = self._runner((self._history_binary, "-l", "-n", "0", job_id))
+        if completed.returncode != 0:
+            return None
+        ends = _HISTORY_END.findall(completed.stdout)
+        return _finish_time(ends[-1].split()) if ends else None
+
+    def cancel(self, job_id: str) -> None:
+        self._require_job_id(job_id)
+        completed = self._runner((self._cancel_binary, job_id))
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise InfrastructureError(
+                f"cannot cancel LSF job {job_id} "
+                f"(exit {completed.returncode}): {detail}"
+            )
+
+    @staticmethod
+    def _require_job_id(job_id: str) -> None:
+        if not job_id.isdecimal():
+            raise SetupError(f"invalid exact LSF job ID: {job_id!r}")
+
+    @staticmethod
+    def _parse_status(job_id: str, output: str) -> tuple[str, int]:
+        fields = output.strip().split()
+        if not fields:
+            raise InfrastructureError(f"LSF job {job_id} returned an empty status")
+        state = fields[0].upper()
+        raw_exit_code = fields[1] if len(fields) > 1 else "-"
+        if raw_exit_code == "-":
+            exit_code = 0 if state == "DONE" else 1
+        else:
+            try:
+                exit_code = int(raw_exit_code)
+            except ValueError as error:
+                raise InfrastructureError(
+                    f"LSF job {job_id} returned invalid exit code {raw_exit_code!r}"
+                ) from error
+        return state, exit_code

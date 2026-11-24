@@ -1,0 +1,27 @@
+{
+  "bundle_hashes": {
+    "RSI-Harness": "9c695d82a2837bdf06fa799cf942676a07845c3d928424a86ab2ed6914a10734",
+    "cluster-harbor-task-validator": "6954725c74dcb6139737359a92b8758f7510ac23a87c468b9a24ad95b7df3ad5",
+    "cluster-rsi-task-runner": "bb0bd738e1a4e8281a98b787d8c0e2a0a4fb68c79d97b7211d639b150088734a",
+    "harbor-task-validator": "968480285b998b9afa30ae68ecae71198f3219429310106c24670ed213856608",
+    "rsi-task-runner": "a99d03976d653eb315cb894077180374afb1b58a3b0883506102522b1beba384"
+  },
+  "compiler_validation": "PASS",
+  "confirmation_sha256": "85287ed10ac779df2e3a1ebe7284be0767d47e597c8477962a6ecb27b5fe8a99",
+  "correction_count": 1,
+  "final_status": "PASS",
+  "initial_review_decision": "CHANGES_REQUIRED",
+  "proposal_sha256": "9e5b93b10debd46901de55720a07195dc3b3235cb25dc9e643adff3a47944193",
+  "public_commit": "62d956f03682e21a746b3476a8ef56c287c24f2d",
+  "rereview_decision": "PASS",
+  "schema": 3,
+  "skills_commit": "238ce9c4d1662b9013e12583f66101c242add945",
+  "source": {
+    "discussion_node_id": "D_kwDOT4zfac4ArdEe",
+    "discussion_number": 405,
+    "discussion_url": "https://github.com/OpenRSI-Foundation/OpenRSI-Index/discussions/405"
+  },
+  "static_validation": "PASS",
+  "task_tree_sha256": "6ebad419406cf8fe5d469c4ea4d817e85aca31ea03831c18e71d3a6649c6b0fc",
+  "validation_attestation_sha256": "fdef52bd33bd8a8c623594fbde9e453634d32d592d2e07c5a1a8d39d757eccd9"
+}

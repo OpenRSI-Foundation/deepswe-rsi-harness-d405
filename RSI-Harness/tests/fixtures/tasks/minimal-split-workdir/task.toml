@@ -1,0 +1,23 @@
+schema_version = "1.4"
+
+[task]
+name = "rsi/minimal-split-workdir"
+
+[environment]
+os = "linux"
+workdir = "/workspace"
+gpus = 2
+network_mode = "no-network"
+
+[agent]
+timeout_sec = 60
+network_mode = "public"
+
+[verifier]
+timeout_sec = 30
+network_mode = "no-network"
+
+# The Judge runs a tool the Agent installs outside WORKDIR, which only the
+# Work-snapshot Judge sees.
+[metadata.rsi_harness.verifier]
+clean_image = false

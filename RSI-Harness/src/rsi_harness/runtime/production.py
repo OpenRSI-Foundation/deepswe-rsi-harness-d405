@@ -1,0 +1,2476 @@
+"""Concrete production composition for CLI run, recovery, and cleanup."""
+
+from __future__ import annotations
+
+import hashlib
+import ipaddress
+import os
+import re
+import shutil
+import sys
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
+from typing import Any
+from urllib.parse import urlsplit
+
+import docker
+from docker.errors import APIError, NotFound
+
+from rsi_harness.config import EngineConfig
+from rsi_harness.errors import InfrastructureError, SetupError
+from rsi_harness.integrations.rsi_loop import (
+    RSILoopAgentAdapter,
+    rsi_loop_agent_environment,
+    rsi_loop_runtime_secret_values,
+    task_solution_script,
+    validate_agent_config,
+    validate_agent_reasoning_effort,
+)
+from rsi_harness.judge_agent import JUDGE_CODEX_CACHE
+from rsi_harness.models import (
+    WORK_FEEDBACK_ROOT,
+    AgentAuthSource,
+    AgentHookRequest,
+    AgentPrepareRequest,
+    AgentResume,
+    AgentRunRequest,
+    AgentRunResult,
+    ContainerMount,
+    ContainerRef,
+    ContainerSpec,
+    ContainerVolumeMount,
+    EvaluationRequest,
+    MainServiceConfig,
+    ManagedNetwork,
+    ManagedWorkdirVolume,
+    RootfsSnapshotLease,
+    RootfsSnapshotMode,
+    RunRequest,
+    RunResult,
+    SubmissionReport,
+    WorkQuiescence,
+    describe_provider_stop,
+)
+from rsi_harness.runtime.artifacts import RunArtifactWriter
+from rsi_harness.runtime.coordinator import (
+    EmbeddedSubmissionServerFactory,
+    ProductionCoordinatorBackend,
+    RunCoordinator,
+    RunPreparation,
+)
+from rsi_harness.runtime.desktop import (
+    DesktopHost,
+    PrivateLogContentError,
+    export_private_logs,
+    has_private_log_volume,
+    is_desktop,
+    validate_desktop_images,
+    validate_desktop_task,
+    validate_local_daemon,
+)
+from rsi_harness.runtime.docker import DockerContainerRuntime
+from rsi_harness.runtime.durable import fsync_directory
+from rsi_harness.runtime.environment import (
+    MissingRuntimeEnvironmentError,
+    resolve_runtime_environment,
+    runtime_template_name,
+)
+from rsi_harness.runtime.gpu import (
+    NVIDIA_VISIBLE_DEVICES_ENV,
+    NvidiaSmiInventory,
+    assert_work_gpu_quiescent,
+    nvidia_visible_devices_value,
+    resolve_gpu_plan,
+)
+from rsi_harness.runtime.images import DockerImageBuilder
+from rsi_harness.runtime.judge import (
+    DockerJudgeRuntimeFactory,
+    JudgeRunner,
+    clean_judge_unavailable,
+)
+from rsi_harness.runtime.judge_llm import resolve_judge_llm, snapshot_judge_refusal
+from rsi_harness.runtime.judge_model_access import (
+    JudgeModelAccess,
+    resolve_judge_model_access,
+)
+from rsi_harness.runtime.local_auth import (
+    AgentAuthMaterial,
+    resolve_agent_auth,
+)
+from rsi_harness.runtime.netns_firewall import (
+    ContainerNetnsFirewall,
+    RecoveryFirewall,
+    container_netns_firewall_selected,
+    require_container_netns_support,
+)
+from rsi_harness.runtime.network import (
+    DockerIptablesFirewallBackend,
+    FirewallRuleNotFound,
+    NetworkPolicyEnforcer,
+    NetworkPolicyLease,
+    PinnedEndpoint,
+    firewall_rule_chains,
+    no_network_dns_servers,
+    provider_bypasses_proxy,
+)
+from rsi_harness.runtime.recovery import (
+    AttemptGrants,
+    LeaseStore,
+    RecoveryManager,
+    SnapshotRecoveryAuthority,
+    retained_round_id,
+)
+from rsi_harness.runtime.redaction import redact_exact_values, redact_text
+from rsi_harness.runtime.resume import ResumeContext, plan_resume, same_gpu_shape
+from rsi_harness.runtime.rootfs_snapshot import DockerRootfsSnapshotBackend
+from rsi_harness.runtime.run_request import write_run_request
+from rsi_harness.runtime.sandbox import SandboxBroker
+from rsi_harness.runtime.sandbox_budget import SandboxAdmissionPool, SandboxJournal
+from rsi_harness.runtime.sandbox_build import engine_socket
+from rsi_harness.runtime.sandbox_buildfs import (
+    CommandRunner,
+    remove_loop_file,
+    run_command,
+)
+from rsi_harness.runtime.sandbox_contracts import (
+    SandboxEnvTask,
+    SandboxLease,
+    SandboxPolicy,
+)
+from rsi_harness.runtime.sandbox_docker import SandboxDockerBackend
+from rsi_harness.runtime.sandbox_env_contracts import (
+    BuilderLease,
+    SandboxEnvLease,
+    sandbox_spool_root,
+)
+from rsi_harness.runtime.sandbox_env_docker import (
+    PausedKiller,
+    default_paused_killer,
+    terminate_container,
+)
+from rsi_harness.runtime.sandbox_envs import docker_env_runtime
+from rsi_harness.runtime.sandbox_ledger import (
+    ImagePruner,
+    PruneRow,
+    PullLedger,
+    pull_ledger_root,
+)
+from rsi_harness.runtime.sandbox_lifecycle import NullSandboxLifecycle, SandboxLifecycle
+from rsi_harness.runtime.sandbox_network import (
+    SandboxNetworkBackend,
+    env_lease_network_plan,
+    plan_builder_network,
+)
+from rsi_harness.runtime.sandbox_policy import (
+    load_sandbox_policy,
+    resolve_env_grant,
+    resolve_sandbox_grant,
+    validate_sandbox_policy,
+)
+from rsi_harness.runtime.sandbox_remote import (
+    bind_ledger,
+    remote_backend,
+    remote_env_runtime,
+)
+from rsi_harness.runtime.sandbox_tools import check_tools
+from rsi_harness.runtime.snapshot import OverlaySnapshotBackend
+from rsi_harness.runtime.workdir_volume import (
+    DockerWorkdirVolumeBackend,
+    normalized_workdir_volume_container_references,
+)
+from rsi_harness.runtime.workspace import delete_managed_workspace
+from rsi_harness.task.compiler import HarborTaskCompiler
+from rsi_harness.task.digest import require_tests_digest
+from rsi_loop.harness.agent import create_agent
+from rsi_loop.harness.config import RSILoopConfig, load_config
+
+
+class _Clock:
+    def now(self) -> datetime:
+        return datetime.now(UTC)
+
+
+def sandbox_builder_images(client: Any, task: Any, policy: Any) -> dict[str, Any]:
+    """``docker image inspect`` of each approved builder image a requested
+    build uses, by phase; resolve_env_grant checks and pins them. The broker
+    never pulls a builder: an image missing here fails the run's setup, as
+    does a Docker host other than a Unix socket (image loads use it, B8)."""
+    environments = getattr(policy, "environments", None)
+    found: dict[str, Any] = {}
+    if not isinstance(task, SandboxEnvTask) or environments is None:
+        return found
+    for phase in ("work", "judge"):
+        requested = getattr(task.environments, phase)
+        grant = getattr(environments, phase)
+        if requested is None or not requested.build or grant is None:
+            continue
+        if grant.build is None:
+            continue
+        engine_socket(client.api)
+        try:
+            found[phase] = client.api.inspect_image(grant.build.builder_image)
+        except NotFound:
+            continue
+    return found
+
+
+def _safe_endpoint_label(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return "configured endpoint"
+    if parsed.hostname is None:
+        return "configured endpoint"
+    return parsed.hostname
+
+
+def _parse_agent_endpoint(value: str) -> Any:
+    try:
+        return urlsplit(value)
+    except ValueError as error:
+        raise SetupError(
+            "invalid Agent provider/proxy endpoint for configured endpoint"
+        ) from error
+
+
+def _agent_endpoints(
+    definition: Any,
+    config: RSILoopConfig,
+    agent_auth: AgentAuthMaterial | None = None,
+) -> tuple[PinnedEndpoint, ...]:
+    """Resolve provider/proxy authority before any runtime mutation."""
+
+    selected = create_agent(definition.agent.name, config)
+    if getattr(selected, "runs_task_solution", False):
+        # No model, so no provider to pin: a no-network Work stays closed
+        # apart from the control endpoint.
+        return ()
+    model = definition.agent.model or config.agent_model or selected.default_model
+    environment = rsi_loop_agent_environment(config, selected, model)
+    default_provider = (
+        environment.get(selected.api_base_env) if selected.api_base_env else None
+    ) or getattr(selected, "default_api_base_url", None)
+    providers = (
+        agent_auth.provider_endpoints
+        if agent_auth is not None and agent_auth.provider_endpoints
+        else ((default_provider,) if default_provider else ())
+    )
+    provider_schemes = {
+        _parse_agent_endpoint(provider).scheme for provider in providers
+    }
+    provider_scheme = (
+        next(iter(provider_schemes)) if len(provider_schemes) == 1 else None
+    )
+    proxy_keys = {
+        "http": ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"),
+        "https": ("https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"),
+    }.get(
+        provider_scheme,
+        (
+            "http_proxy",
+            "HTTP_PROXY",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+        ),
+    )
+    proxies = tuple(
+        dict.fromkeys(environment[key] for key in proxy_keys if environment.get(key))
+    )
+    if definition.agent.network.mode == "no-network" and not (providers or proxies):
+        raise SetupError(
+            "no-network Agent requires a registered default API base URL, "
+            "an explicit API base URL, or an HTTP/HTTPS proxy so provider "
+            "access can be pinned"
+        )
+    endpoints = list(proxies)
+    for provider in providers:
+        if not proxies or provider_bypasses_proxy(provider, environment):
+            endpoints.append(provider)
+    result = _pin_ipv4_endpoints(tuple(endpoints), "Agent provider/proxy")
+    if definition.agent.network.mode == "allowlist":
+        for endpoint in result:
+            if not _allowlist_contains_endpoint(
+                definition.agent.network.allowlist, endpoint
+            ):
+                raise SetupError(
+                    "Agent allowlist does not explicitly permit provider/proxy "
+                    f"endpoint {endpoint.hostname}"
+                )
+    return result
+
+
+def _pin_ipv4_endpoints(
+    endpoints: tuple[str, ...], what: str
+) -> tuple[PinnedEndpoint, ...]:
+    """Resolve and pin http(s) endpoints to their IPv4 addresses."""
+    endpoints = tuple(dict.fromkeys(endpoints))
+    for endpoint in endpoints:
+        parsed = _parse_agent_endpoint(endpoint)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+            raise SetupError(
+                f"invalid {what} endpoint for {_safe_endpoint_label(endpoint)}"
+            )
+    pinned = NetworkPolicyEnforcer(run_id="provider-preflight").pin_endpoints(endpoints)
+    ipv4_pinned: list[PinnedEndpoint] = []
+    for endpoint in pinned:
+        addresses = tuple(
+            address
+            for address in endpoint.addresses
+            if isinstance(address, ipaddress.IPv4Address)
+        )
+        if not addresses:
+            raise SetupError(
+                f"{what} endpoint has no IPv4-safe address: {endpoint.hostname}"
+            )
+        ipv4_pinned.append(
+            PinnedEndpoint(
+                hostname=endpoint.hostname,
+                port=endpoint.port,
+                addresses=addresses,
+            )
+        )
+    return tuple(ipv4_pinned)
+
+
+def _allowlist_contains_endpoint(
+    allowlist: Sequence[str], endpoint: PinnedEndpoint
+) -> bool:
+    networks = []
+    for entry in allowlist:
+        normalized = entry.rstrip(".").lower()
+        if normalized == endpoint.hostname:
+            return True
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            continue
+    return all(
+        any(address in network for network in networks)
+        for address in endpoint.addresses
+    )
+
+
+_MOUNTINFO_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+# Per-response read timeout for the Docker API. The SDK default of 60 seconds
+# is shorter than a rootfs commit of a Work container that wrote tens of GB
+# (each Judge round commits the Work rootfs), which surfaced as a spurious
+# infrastructure_error while the daemon kept committing and leaked the image.
+DOCKER_API_TIMEOUT_SECONDS = 3600
+# Per-response read timeout of the v2 env runtime's own Docker client. The
+# 5 s child control transport is too short for env objects: removing a
+# service whose writable layer grew (apt in a TB2 task) or archiving a large
+# tree can take longer on a busy daemon, and a timeout there surfaces as an
+# unknown outcome. Destroy's removal stage is bounded by 60 s as well, and
+# the env Docker tests run with this same bound. Image pulls set no timeout.
+SANDBOX_ENV_DOCKER_TIMEOUT_SECONDS = 60
+
+
+def _decode_mountinfo_field(value: str) -> str:
+    return _MOUNTINFO_ESCAPE.sub(lambda match: chr(int(match.group(1), 8)), value)
+
+
+def _mountinfo_references_workspace(text: str, workspace: Path) -> bool:
+    """Fail closed if any mount target/source/layer references a workspace."""
+
+    root = workspace.resolve(strict=False)
+
+    def references(raw_value: str) -> bool:
+        decoded = _decode_mountinfo_field(raw_value)
+        candidate = Path(decoded)
+        if not candidate.is_absolute():
+            return False
+        resolved = candidate.resolve(strict=False)
+        return resolved == root or root in resolved.parents
+
+    lines = text.splitlines()
+    if not lines:
+        raise SetupError("cannot inspect workspace mounts: mountinfo is empty")
+    for line in lines:
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+        except ValueError as error:
+            raise SetupError(
+                "cannot inspect workspace mounts: malformed mountinfo"
+            ) from error
+        if len(fields) < 7 or separator + 3 >= len(fields):
+            raise SetupError("cannot inspect workspace mounts: malformed mountinfo")
+        # mount root, mount target, and filesystem source may each reference a
+        # managed tree.  Overlay/FUSE paths live in keyed mount/super options.
+        if any(
+            references(value) for value in (fields[3], fields[4], fields[separator + 2])
+        ):
+            return True
+        for options in (fields[5], fields[separator + 3]):
+            for option in options.split(","):
+                key, present, value = option.partition("=")
+                if not present or key not in {"lowerdir", "upperdir", "workdir"}:
+                    continue
+                values = value.split(":") if key == "lowerdir" else (value,)
+                if any(references(candidate) for candidate in values):
+                    return True
+    return False
+
+
+def coordinator_may_run(
+    pid: int, started_at: float, *, proc: Path = Path("/proc")
+) -> bool:
+    """Whether ``pid`` may still be the coordinator that wrote its lease at
+    ``started_at`` (epoch seconds): live, not a zombie, and started no later.
+
+    A PID started afterwards was reused. Anything unreadable counts as
+    running, so a pending create then stays unresolved (fail closed); so
+    does a missing PID when ``/proc`` hides even PID 1 (hidepid).
+    """
+    if pid <= 0:
+        return True
+    try:
+        stat = (proc / str(pid) / "stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        try:
+            (proc / "1" / "stat").read_text()
+        except OSError:
+            return True
+        return False
+    except OSError:
+        return True
+    try:
+        # The command name may hold spaces and parentheses; fields follow it.
+        fields = stat[stat.rindex(")") + 2 :].split()
+        state, start_ticks = fields[0], int(fields[19])
+        boot = next(
+            int(line.split()[1])
+            for line in (proc / "stat").read_text().splitlines()
+            if line.startswith("btime ")
+        )
+        started = boot + start_ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration):
+        return True
+    if state in ("Z", "X"):
+        return False
+    # btime has whole-second resolution: err towards running.
+    return started <= started_at + 2.0
+
+
+def firewall_commands_running(
+    rule_ids: Sequence[str], *, proc: Path = Path("/proc")
+) -> bool:
+    """Whether a live process still runs a firewall command for these rules.
+
+    A SIGKILLed broker's ``iptables --wait`` child outlives it and may still
+    land. Every command of an install names one of the rule's chains (-N,
+    -A, and the jump's -j). A process that vanishes while read is gone;
+    anything else unreadable counts as running (fail closed).
+    """
+    needles = {
+        chain.encode()
+        for rule_id in rule_ids
+        for chain in firewall_rule_chains(rule_id)
+    }
+    if not needles:
+        return False
+    try:
+        entries = [entry for entry in proc.iterdir() if entry.name.isdigit()]
+    except OSError:
+        return True
+    for entry in entries:
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            return True
+        if needles.intersection(argv):
+            return True
+    return False
+
+
+# Long enough for the daemon to finish a create a killed broker already sent;
+# anything later still carries the run's labels for the next sweep.
+ENV_CREATE_SETTLE_SEC = 5.0
+
+
+def _check_docker_resource_limits(
+    client: Any, service: MainServiceConfig, *, holders: bool
+) -> bool:
+    """Refuse, before any image or run state, a daemon that would refuse the
+    run's CPU limits; return whether it would drop the task's memory limit.
+
+    Docker refuses a container with a CPU limit on a daemon without CPU CFS
+    quota, but only warns and drops a memory limit on one without memory
+    limits. The task's CPUs need the quota, and so does a non-root
+    controller (``holders``), whose network-namespace holders and helper
+    containers always carry a CPU limit."""
+    cpus = holders or (service.cpus is not None and service.cpus > 0)
+    memory = service.memory_mb is not None and service.memory_mb > 0
+    if not (cpus or memory):
+        return False
+    info = client.info()
+    if cpus and info.get("CpuCfsQuota") is not True:
+        needed = (
+            "the task's CPU limit"
+            if service.cpus
+            else "the CPU limit of the non-root controller's helper containers"
+        )
+        raise SetupError(
+            "Docker does not report CPU CFS quota support (CpuCfsQuota), needed "
+            f"for {needed}. Check `docker info` on the selected daemon and, for "
+            "rootless Docker, check cgroup controller delegation."
+        )
+    return memory and info.get("MemoryLimit") is not True
+
+
+def run_firewall(client: Any, definition: Any) -> Any:
+    """The host firewall as root; each container's own namespace otherwise."""
+    if not container_netns_firewall_selected():
+        return DockerIptablesFirewallBackend(client)
+    if definition.sandbox is not None:
+        raise SetupError(
+            "sandbox tasks need the host firewall: run rsi-harness as root (sudo -E)"
+        )
+    require_container_netns_support(client)
+    firewall = ContainerNetnsFirewall(client)
+    # Before any run state: the controller shares the daemon host's
+    # namespace, and the host's own addresses are known.
+    firewall.host_destinations()
+    return firewall
+
+
+def recovery_firewall(client: Any) -> RecoveryFirewall:
+    """Recovery may meet rules of either backend, whoever runs it."""
+    return RecoveryFirewall(
+        DockerIptablesFirewallBackend(client), ContainerNetnsFirewall(client)
+    )
+
+
+class ProductionRecoveryBackend:
+    """Bind recovery authority to Docker labels, overlay manifests and iptables."""
+
+    def __init__(
+        self,
+        client: Any,
+        snapshot: Any,
+        firewall: Any,
+        *,
+        paused_killer: PausedKiller | None = None,
+        settle_sec: float = ENV_CREATE_SETTLE_SEC,
+        proc: Path = Path("/proc"),
+        loop_runner: CommandRunner = run_command,
+    ) -> None:
+        self._client = client
+        self._snapshot = snapshot
+        self._firewall = firewall
+        self._paused_killer = paused_killer
+        self._settle_sec = settle_sec
+        self._proc = proc
+        self._loop_runner = loop_runner
+
+    @staticmethod
+    def _filter(labels: Mapping[str, str]) -> dict[str, list[str]]:
+        return {"label": [f"{key}={value}" for key, value in labels.items()]}
+
+    def list_containers(
+        self, *, labels: Mapping[str, str]
+    ) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+        found = self._client.containers.list(all=True, filters=self._filter(labels))
+        return tuple((item.id, self._container_state(item)) for item in found)
+
+    def list_container_candidates(
+        self, *, labels: Mapping[str, str]
+    ) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+        """Discovery only: do not let one failed inspect hide healthy siblings."""
+        # The high-level SDK collection list eagerly inspects every result.
+        # Recovery independently re-inspects and attests each returned ID.
+        return tuple(
+            (item["Id"], {"labels": dict(item.get("Labels") or {})})
+            for item in self._client.api.containers(
+                all=True, filters=self._filter(labels)
+            )
+        )
+
+    def _container_state(self, container: Any) -> Mapping[str, Any]:
+        container.reload()
+        state = container.attrs.get("State") or {}
+        config = container.attrs.get("Config") or {}
+        labels = config.get("Labels") or {}
+        finished_at: float | None = None
+        try:
+            finished_at = datetime.fromisoformat(state["FinishedAt"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            pass
+        return {
+            "running": bool(state.get("Running", False)),
+            "paused": bool(state.get("Paused", False)),
+            # Docker reports year 1 for a container that never exited.
+            "finished_at": (
+                finished_at if finished_at is not None and finished_at > 0 else None
+            ),
+            "labels": dict(labels),
+            "id": container.id,
+            "name": (container.attrs.get("Name") or "").removeprefix("/"),
+            "image_id": container.attrs.get("Image"),
+            "private_log_volume": has_private_log_volume(self._client, container),
+        }
+
+    def inspect_container(self, container_id: str) -> Mapping[str, Any] | None:
+        try:
+            return self._container_state(self._client.containers.get(container_id))
+        except NotFound:
+            return None
+
+    def stop_container(self, container_id: str) -> None:
+        try:
+            self._client.containers.get(container_id).stop(timeout=10)
+        except NotFound:
+            return
+
+    def remove_container(self, container_id: str) -> None:
+        try:
+            container = self._client.containers.get(container_id)
+            if has_private_log_volume(self._client, container):
+                container.remove(force=False, v=True)
+            else:
+                container.remove(force=False)
+        except NotFound:
+            return
+
+    def collect_private_judge_logs(self, container_id: str, target: Path) -> None:
+        try:
+            export_private_logs(self._client, container_id, target)
+        except PrivateLogContentError:
+            # Recovery marks interrupted rounds unscored. The controller-owned
+            # rejection diagnostic is already durable; cleanup can proceed.
+            pass
+
+    def terminate_sandbox(self, child: SandboxLease) -> None:
+        SandboxDockerBackend(self._client).terminate(child)
+
+    def remove_sandbox(self, child: SandboxLease) -> None:
+        SandboxDockerBackend(self._client).remove(child)
+
+    def kill_sandbox_container(self, container_id: str) -> None:
+        """SIGKILL an env service, paused or not, and await its stop (M3):
+        cgroup.kill as root, so a frozen service never runs again."""
+        api = self._client.api
+
+        def inspect() -> Mapping[str, Any] | None:
+            try:
+                return api.inspect_container(container_id)
+            except NotFound:
+                return None
+
+        terminate_container(
+            api,
+            container_id,
+            inspect=inspect,
+            paused_killer=self._paused_killer or default_paused_killer(api),
+        )
+
+    def remove_sandbox_container(self, container_id: str) -> None:
+        try:
+            # v=True: no anonymous volume may outlive its container.
+            self._client.api.remove_container(container_id, v=True, force=False)
+        except NotFound:
+            return
+
+    def recover_sandbox_network(
+        self, env: SandboxEnvLease | BuilderLease, *, settled: bool = False
+    ) -> tuple[str, ...]:
+        """The env or builder bridge, then its firewall rule, each proven
+        absent (M2).
+
+        A pending bridge create that finds nothing keeps its rule, unless
+        recovery proved that create settled.
+        """
+        network = SandboxNetworkBackend(self._client, self._firewall)
+        if not settled:
+            return network.recover(env)
+        if isinstance(env, BuilderLease):
+            plan = plan_builder_network(env.owner, env.builder_id)
+        else:
+            plan = env_lease_network_plan(env)
+        return () if plan is None else network.remove(plan, env.network_id)
+
+    def remove_builder_loop(self, path: Path) -> None:
+        """Detach every loop device of a builder file, then remove it (M8)."""
+        remove_loop_file(path, self._loop_runner)
+
+    def coordinator_alive(self, pid: int, started_at: float) -> bool:
+        return coordinator_may_run(pid, started_at, proc=self._proc)
+
+    def settle_sandbox_creates(self, rule_ids: tuple[str, ...]) -> bool:
+        """Let a create the dead broker sent land, then prove that no firewall
+        command for ``rule_ids`` still runs."""
+        time.sleep(self._settle_sec)
+        return not firewall_commands_running(rule_ids, proc=self._proc)
+
+    @staticmethod
+    def remove_sandbox_spool(path: Path) -> None:
+        # rmtree refuses a symlinked root and never follows links below it.
+        shutil.rmtree(path)
+
+    def list_images(
+        self, *, labels: Mapping[str, str]
+    ) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+        found = self._client.images.list(filters=self._filter(labels))
+        return tuple((item.id, self._image_state(item)) for item in found)
+
+    def list_tagged_images(
+        self, prefix: str
+    ) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+        """Images with a ``repository:tag`` starting with ``prefix``."""
+        found = self._client.images.list(filters={"reference": f"{prefix}*"})
+        return tuple(
+            (item.id, self._image_state(item))
+            for item in found
+            if any(tag.startswith(prefix) for tag in item.tags)
+        )
+
+    @staticmethod
+    def _image_state(image: Any) -> Mapping[str, Any]:
+        image.reload()
+        attrs = image.attrs
+        config = attrs.get("Config") or {}
+        labels = config.get("Labels") or {}
+        repo_tags = attrs.get("RepoTags") or ()
+        return {
+            "id": attrs.get("Id"),
+            "labels": dict(labels),
+            "repo_tags": tuple(repo_tags),
+        }
+
+    def inspect_image(self, image_id: str) -> Mapping[str, Any] | None:
+        try:
+            return self._image_state(self._client.images.get(image_id))
+        except NotFound:
+            return None
+
+    def image_in_use(self, image_id: str) -> bool:
+        found = self._client.containers.list(all=True, filters={"ancestor": image_id})
+        if not isinstance(found, list):
+            raise TypeError("Docker returned malformed image references")
+        return bool(found)
+
+    def remove_image(self, image_id: str) -> None:
+        try:
+            self._client.images.remove(image_id, force=False)
+        except NotFound:
+            return
+
+    def list_volumes(
+        self, *, labels: Mapping[str, str]
+    ) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+        found = self._client.volumes.list(filters=self._filter(labels))
+        if not isinstance(found, list):
+            raise TypeError("Docker returned malformed volume results")
+        return tuple(
+            (state["name"], state)
+            for state in (self._volume_state(volume) for volume in found)
+        )
+
+    def inspect_volume(self, name: str) -> Mapping[str, Any] | None:
+        try:
+            return self._volume_state(self._client.volumes.get(name))
+        except NotFound:
+            return None
+
+    def volume_in_use(self, name: str) -> bool:
+        return bool(self._volume_container_references(name))
+
+    def remove_volume(self, name: str) -> None:
+        try:
+            self._client.volumes.get(name).remove(force=False)
+        except NotFound:
+            return
+
+    def _volume_state(self, volume: Any) -> Mapping[str, Any]:
+        volume.reload()
+        attrs = volume.attrs
+        name = attrs.get("Name")
+        if not isinstance(name, str):
+            raise TypeError("Docker returned malformed volume name")
+        labels = attrs.get("Labels")
+        options = attrs.get("Options")
+        scope = attrs.get("Scope")
+        if labels is None:
+            labels = {}
+        if options is None:
+            options = {}
+        if scope is None:
+            scope = ""
+        if not isinstance(labels, Mapping) or not isinstance(options, Mapping):
+            raise TypeError("Docker returned malformed volume attributes")
+        if not isinstance(scope, str):
+            raise TypeError("Docker returned malformed volume scope")
+        return {
+            "name": name,
+            "driver": attrs.get("Driver"),
+            "labels": dict(labels),
+            "options": dict(options),
+            "scope": scope,
+            "container_references": normalized_workdir_volume_container_references(
+                self._client, name
+            ),
+        }
+
+    def _volume_container_references(self, name: str) -> tuple[Mapping[str, Any], ...]:
+        return normalized_workdir_volume_container_references(self._client, name)
+
+    def list_networks(
+        self, *, labels: Mapping[str, str]
+    ) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+        found = self._client.networks.list(filters=self._filter(labels))
+        result = []
+        for network in found:
+            network.reload()
+            state = dict(network.attrs)
+            state["labels"] = dict(network.attrs.get("Labels") or {})
+            result.append((network.id, state))
+        return tuple(result)
+
+    def network_in_use(self, network_id: str) -> bool:
+        try:
+            network = self._client.networks.get(network_id)
+        except NotFound:
+            return False
+        network.reload()
+        return bool(network.attrs.get("Containers"))
+
+    def remove_network(self, network_id: str) -> None:
+        try:
+            self._client.networks.get(network_id).remove()
+        except NotFound:
+            return
+
+    @staticmethod
+    def is_mounted(path: Path) -> bool:
+        return path.is_mount()
+
+    def discover_snapshot_leases(
+        self,
+        *,
+        run_id: str,
+        round_id: str | None,
+        lease_id: str | None,
+    ) -> tuple[SnapshotRecoveryAuthority, ...]:
+        return self._snapshot.discover_snapshot_leases(
+            run_id=run_id, round_id=round_id, lease_id=lease_id
+        )
+
+    def release_snapshot(self, authority: SnapshotRecoveryAuthority) -> None:
+        self._snapshot.release_snapshot(authority)
+
+    def unpause_container(self, container_id: str) -> None:
+        try:
+            self._client.containers.get(container_id).unpause()
+        except NotFound:
+            return
+
+    def commit_work(
+        self,
+        container_id: str,
+        *,
+        run_id: str,
+        task_id: str,
+        round_id: str,
+        planned_ref: str,
+    ) -> str:
+        return (
+            DockerRootfsSnapshotBackend(self._client)
+            .acquire(
+                ContainerRef(container_id=container_id, role="work"),
+                run_id=run_id,
+                task_id=task_id,
+                round_id=round_id,
+                purpose="retained-work",
+                planned_ref=planned_ref,
+            )
+            .image_id
+        )
+
+    def remove_policy(self, rule_id: str) -> None:
+        try:
+            self._firewall.remove(rule_id)
+        except FirewallRuleNotFound:
+            return
+
+    def policy_exists(self, rule_id: str) -> bool:
+        return bool(self._firewall.exists(rule_id))
+
+    @staticmethod
+    def workspace_is_mounted(workspace: Path) -> bool:
+        try:
+            mountinfo = Path("/proc/self/mountinfo").read_text()
+        except OSError as error:
+            raise SetupError(f"cannot inspect workspace mounts: {error}") from error
+        return _mountinfo_references_workspace(mountinfo, workspace)
+
+    def delete_workspace(
+        self,
+        workspace: Path,
+        *,
+        image_ref: str,
+        run_id: str,
+        task_id: str,
+    ) -> None:
+        delete_managed_workspace(
+            self._client,
+            workspace=workspace,
+            image_ref=image_ref,
+            run_id=run_id,
+            task_id=task_id,
+        )
+
+
+class _ProductionRunComposition:
+    def __init__(
+        self,
+        *,
+        client: Any,
+        data_root: Path,
+        logs_root: Path,
+        inventory: Any,
+        rsi_loop_config: RSILoopConfig,
+        snapshot: Any,
+        firewall: Any,
+        bind_host: str,
+        bridge_gateway: str,
+        omit_gpu_device_requests_for_tests: bool,
+        agent_adapter_factory: Callable[[RSILoopConfig, Any], Any],
+        quiescence_checker: Callable[[Any, ContainerRef], None] | None,
+        api_endpoints: tuple[PinnedEndpoint, ...],
+        agent_secret_env: Mapping[str, str],
+        verifier_secret_env: Mapping[str, str],
+        agent_auth: AgentAuthMaterial | None = None,
+        judge_model_access: JudgeModelAccess | None = None,
+        event_callback: Callable[[str, object], None] | None = None,
+        preparation: RunPreparation | None = None,
+        compiler: HarborTaskCompiler | None = None,
+        sandbox_policy: SandboxPolicy | None = None,
+        sandbox_policy_path: Path | None = None,
+        resume: ResumeContext | None = None,
+    ) -> None:
+        del inventory
+        self.client = client
+        self.data_root = data_root
+        self.logs_root = logs_root
+        self.rsi_loop_config = rsi_loop_config
+        self.snapshot = snapshot
+        self.firewall = firewall
+        self.bind_host = bind_host
+        self.bridge_gateway = bridge_gateway
+        self.omit_gpu = omit_gpu_device_requests_for_tests
+        self.agent_adapter_factory = agent_adapter_factory
+        self.quiescence_checker = quiescence_checker or (
+            lambda allocation, ref: assert_work_gpu_quiescent(
+                allocation, self.client.containers.get(ref.container_id)
+            )
+        )
+        self.api_endpoints = api_endpoints
+        self.agent_secret_env = dict(agent_secret_env)
+        self.verifier_secret_env = dict(verifier_secret_env)
+        self.agent_auth = agent_auth
+        # Held for the whole run, unlike the Agent's transient bindings: a
+        # drained Judge round can still run after the Agent exits.
+        self.judge_model_access = judge_model_access
+        self.event_callback = event_callback or (lambda _name, _value: None)
+        self.preparation = preparation
+        self.agent_output_secrets = rsi_loop_runtime_secret_values(rsi_loop_config)
+        if agent_auth is not None:
+            self.agent_output_secrets.update(agent_auth.secret_values)
+        self.compiler = compiler or HarborTaskCompiler()
+        self.rootfs_snapshots = DockerRootfsSnapshotBackend(client)
+        self.workdir_volumes = DockerWorkdirVolumeBackend(client)
+        self.definition: Any = None if preparation is None else preparation.definition
+        self.plan: Any = None
+        self.run_id = ""
+        self.artifacts: RunArtifactWriter | None = None
+        self.enforcer: NetworkPolicyEnforcer | None = None
+        self.work_runtime: DockerContainerRuntime | None = None
+        self.work_public_tests = False
+        self.work_provisioner: DockerContainerRuntime | None = None
+        self.agent: Any = None
+        self.started_server: Any = None
+        self.planned_work_network: str | None = None
+        self.work_network: ManagedNetwork | None = None
+        self.planned_workdir_volume: ManagedWorkdirVolume | None = None
+        self.workdir_volume: ManagedWorkdirVolume | None = None
+        self.planned_work_policy: NetworkPolicyLease | None = None
+        self.sandbox_policy = sandbox_policy
+        self.sandbox_policy_path = sandbox_policy_path
+        self.resume = resume
+        self.attempt = 1 if resume is None else resume.attempt
+        self.sandbox_lifecycle = (
+            SandboxLifecycle() if sandbox_policy is not None else NullSandboxLifecycle()
+        )
+        self._sandbox_grant = None
+        self._sandbox_broker = None
+        self._sandbox_broker_factory: Callable[[], SandboxBroker] | None = None
+        # (credentials, [environments.host.<backend>]) -> the remote backend's
+        # client; None: the backend's own (tests fake it).
+        self.remote_client_factory: Callable[[tuple[str, ...], Any], Any] | None = None
+
+    def bind_sandbox_lease(self, mutate):
+        """Resolve and reserve child authority before preparing parent images.
+
+        A v2 (environment) grant builds its broker only in prepare_plan: its
+        exec spool lives under the run root, which does not exist yet.
+        """
+        lease = mutate(lambda current: current)
+        if self.definition is None or self.definition.sandbox is None:
+            raise SetupError("sandbox lease requires a prevalidated task")
+        self.sandbox_lifecycle.validate_root(self.data_root / lease.run_id / "sb")
+        child_client = docker.from_env(timeout=5)
+        env_client = None
+        try:
+            # Never silently send child authority to a different daemon when a
+            # programmatic caller supplied a custom parent Docker client.
+            parent_id = self.client.info().get("ID")
+            if not parent_id or child_client.info().get("ID") != parent_id:
+                raise SetupError(
+                    "sandbox parent and child Docker daemon identities differ"
+                )
+            # Paused Work children are killed without a thaw (cgroup.kill as
+            # root), so close() removes them instead of requiring recovery.
+            paused_killer = default_paused_killer(child_client.api)
+            backend = SandboxDockerBackend(child_client, paused_killer=paused_killer)
+            task = self.definition.sandbox
+            environments = getattr(self.sandbox_policy, "environments", None)
+            if (
+                isinstance(task, SandboxEnvTask)
+                and environments is not None
+                and environments.host.backend != "docker"
+            ):
+                # Remote envs: no env Docker client, firewall, builder or root.
+                grant = resolve_env_grant(
+                    task,
+                    self.sandbox_policy,
+                    {},
+                    self.definition.service.cpus,
+                    self.definition.service.memory_mb,
+                )
+                check_tools(grant.environments.host)
+                settings = grant.environments.host.remote
+                remote = remote_backend(grant.environments.host.backend)
+                # Before the SDK is imported: a missing extra is a SetupError.
+                remote.check_host(settings)
+                # Read once, here; they live only in the broker's client.
+                credentials = remote.credentials(settings)
+                self.agent_output_secrets.update(credentials)
+                make_client = self.remote_client_factory or remote.client
+                journal = SandboxJournal(mutate)
+                run_id = lease.run_id
+
+                def build_broker() -> SandboxBroker:
+                    client = make_client(credentials, settings)
+                    # Beside the run's lease, where recovery reads it.
+                    bind_ledger(client, self.data_root / "leases", run_id)
+                    runtime = remote_env_runtime(
+                        client,
+                        spool_root=sandbox_spool_root(self.data_root, run_id),
+                        host=grant.environments.host,
+                    )
+                    return SandboxBroker(
+                        grant,
+                        backend,
+                        journal,
+                        time.monotonic,
+                        envs=runtime,
+                    )
+
+                self._sandbox_broker_factory = build_broker
+                reserved = {"disk_mb": grant.reserved_disk_mb}
+            elif isinstance(task, SandboxEnvTask):
+                env_client = docker.from_env(timeout=SANDBOX_ENV_DOCKER_TIMEOUT_SECONDS)
+                if env_client.info().get("ID") != parent_id:
+                    raise SetupError(
+                        "sandbox parent and env Docker daemon identities differ"
+                    )
+                docker_root = env_client.info().get("DockerRootDir")
+                if not docker_root:
+                    raise SetupError("sandbox Docker root directory is unknown")
+                grant = resolve_env_grant(
+                    task,
+                    self.sandbox_policy,
+                    sandbox_builder_images(env_client, task, self.sandbox_policy),
+                    self.definition.service.cpus,
+                    self.definition.service.memory_mb,
+                )
+                check_tools(grant.environments.host)
+                journal = SandboxJournal(mutate)
+                run_id = lease.run_id
+
+                def build_broker() -> SandboxBroker:
+                    # Recovery removes this same derived spool (M6).
+                    runtime = docker_env_runtime(
+                        env_client,
+                        self.firewall,
+                        run_id=run_id,
+                        spool_root=sandbox_spool_root(self.data_root, run_id),
+                        docker_root=docker_root,
+                        host=grant.environments.host,
+                        engine_destinations=(self.bridge_gateway,),
+                        paused_killer=paused_killer,
+                        # Loop-ext4 builder files: <data>/<run>/sb/build.
+                        data_root=self.data_root,
+                    )
+                    return SandboxBroker(
+                        grant,
+                        backend,
+                        journal,
+                        time.monotonic,
+                        envs=runtime,
+                    )
+
+                self._sandbox_broker_factory = build_broker
+                reserved = {"disk_mb": grant.reserved_disk_mb}
+            else:
+                images = {p.name: backend.preflight(p) for p in task.profiles}
+                grant = resolve_sandbox_grant(
+                    task,
+                    self.sandbox_policy,
+                    images,
+                    self.definition.service.cpus,
+                    self.definition.service.memory_mb,
+                )
+                self._sandbox_broker = SandboxBroker(
+                    grant,
+                    backend,
+                    SandboxJournal(mutate),
+                    time.monotonic,
+                )
+                reserved = {}
+            self.sandbox_lifecycle.reserve(
+                SandboxAdmissionPool(LeaseStore(self.data_root / "leases")),
+                grant,
+                lease.run_id,
+                mutate,
+            )
+            self.sandbox_lifecycle.own_transport(
+                child_client, *(() if env_client is None else (env_client,))
+            )
+            self._sandbox_grant = grant
+            self.event_callback(
+                "sandbox_reserved",
+                {
+                    "cpus": grant.reserved_cpus,
+                    "memory_mb": grant.reserved_memory_mb,
+                    **reserved,
+                },
+            )
+        except BaseException:
+            child_client.close()
+            if env_client is not None:
+                env_client.close()
+            raise
+
+    def backend(self) -> ProductionCoordinatorBackend:
+        return ProductionCoordinatorBackend(
+            compiler=self.compiler,
+            allocator=self.allocate,
+            image_preparer=self.prepare_images,
+            plan_preparer=self.prepare_plan,
+            artifact_starter=self.start_artifacts,
+            server_starter=self.start_server,
+            network_planner=self.plan_network,
+            network_creator=self.create_network,
+            network_remover=self.remove_network,
+            workdir_volume_planner=self.plan_workdir_volume,
+            workdir_volume_creator=self.create_workdir_volume,
+            workdir_volume_attester=self.attest_workdir_volume,
+            workdir_volume_remover=self.remove_workdir_volume,
+            work_name_planner=self.plan_work_container,
+            work_creator=self.create_work,
+            work_feedback_attester=self.attest_work_feedback_mount,
+            work_policy_planner=self.plan_work_policy,
+            work_policy_installer=self.install_work_policy,
+            work_policy_remover=self.remove_work_policy,
+            work_starter=self.start_work,
+            work_remover=self.remove_work,
+            hook_installer=self.install_hooks,
+            agent_preparer=self.prepare_agent,
+            agent_runner=self.run_agent,
+            agent_stopper=self.stop_agent,
+            agent_ender=self.end_agent,
+            work_quiescer=self.quiesce_work,
+            retained_work_planner=self.plan_retained_work,
+            work_retainer=self.retain_work,
+            retained_work_releaser=self.release_retained_work,
+            evaluator=self.evaluate,
+            event_recorder=self.event_callback,
+            preparation=self.preparation,
+            workdir_volume_adopter=self.adopt_workdir_volume,
+        )
+
+    def allocate(self, definition: Any, selectors: Sequence[str]) -> Any:
+        preparation = self.preparation
+        if preparation is None:
+            raise SetupError("production GPU allocation requires prevalidated run")
+        if definition is not preparation.definition:
+            raise SetupError("compiled task changed after production prevalidation")
+        if tuple(selectors) != tuple(preparation.request.gpu_selectors):
+            raise SetupError("GPU selectors changed after production prevalidation")
+        return preparation.gpu_plan
+
+    def prepare_images(self, definition: Any) -> Any:
+        selected = create_agent(definition.agent.name, self.rsi_loop_config)
+        images = DockerImageBuilder(
+            self.client,
+            rsi_loop_config=self.rsi_loop_config,
+            stream_copies=bool(getattr(self.firewall, "container_netns", False)),
+        ).prepare(definition, agent=selected)
+        if is_desktop(self.client):
+            validate_desktop_images(images)
+        unavailable = clean_judge_unavailable(images)
+        if (
+            unavailable is not None
+            and definition.verifier.visibility != "public"
+            and self.judge_model_access is not None
+            and self.judge_model_access.operator_llm_model is not None
+        ):
+            # A snapshot-of-Work Judge must not get the operator's credential.
+            raise SetupError(
+                snapshot_judge_refusal(self.judge_model_access.operator_llm_model)
+                + f" ({unavailable})"
+            )
+        if (
+            self.judge_model_access is not None
+            and self.judge_model_access.needs_codex_cli
+        ):
+            # The Judge LLM's Codex CLI, mounted read-only in each Judge.
+            codex_cli = DockerImageBuilder(
+                self.client,
+                rsi_loop_config=self.rsi_loop_config,
+            ).prepare_judge_codex(
+                definition,
+                images=images,
+                work_agent=selected,
+                cache_root=self.data_root / JUDGE_CODEX_CACHE,
+            )
+            self.judge_model_access = replace(
+                self.judge_model_access, codex_cli=codex_cli
+            )
+        if definition.verifier.visibility == "public":
+            if unavailable is not None:
+                # Refuse before any run state: the Judge needs the clean image.
+                raise SetupError(
+                    f"a public Judge needs the clean Work image, but {unavailable}"
+                )
+        elif definition.verifier.clean_image and unavailable is not None:
+            # Decided before the Agent starts; prepare_plan records it.
+            self.event_callback("judge_clean_image_unavailable", unavailable)
+        self.event_callback("images_ready", None)
+        return images
+
+    def prepare_plan(
+        self,
+        definition: Any,
+        images: Any,
+        gpu_plan: Any,
+        request: RunRequest,
+        run_id: str,
+    ) -> Any:
+        if is_desktop(self.client):
+            validate_desktop_images(images)
+        self.run_id = run_id
+        self.event_callback("run_started", run_id)
+        if self.preparation is not None:
+            if definition is not self.preparation.definition:
+                raise SetupError("RunPlan definition differs from prevalidated run")
+            if gpu_plan is not self.preparation.gpu_plan:
+                raise SetupError("RunPlan GPU plan differs from prevalidated run")
+        else:
+            agent_updates = {}
+            if request.model is not None:
+                agent_updates["model"] = request.model
+            if request.reasoning_effort is not None:
+                agent_updates["reasoning_effort"] = request.reasoning_effort
+            if agent_updates:
+                definition = definition.model_copy(
+                    update={"agent": definition.agent.model_copy(update=agent_updates)}
+                )
+        run_root = (self.data_root / run_id).resolve()
+        if self.resume is None:
+            run_root.mkdir(parents=True, mode=0o700, exist_ok=False)
+        elif not run_root.is_dir():
+            raise SetupError(f"resumed run directory is missing: {run_root}")
+        run_root.chmod(0o700)
+        fsync_directory(run_root.parent)
+        paths = (
+            request.paths.model_copy(
+                update={
+                    "root": run_root,
+                    "workspace": run_root / "workspace",
+                    "logs": self.logs_root,
+                }
+            )
+            if request.paths is not None
+            else None
+        )
+        if paths is None:
+            from rsi_harness.models import RunPaths
+
+            paths = RunPaths(
+                root=run_root,
+                workspace=run_root / "workspace",
+                logs=self.logs_root,
+            )
+        if self.resume is None:
+            write_run_request(
+                run_root,
+                run_id=run_id,
+                request=request.model_copy(update={"paths": paths}),
+                sandbox_policy_path=self.sandbox_policy_path,
+            )
+        self.plan = self.compiler.finalize(
+            definition, images, gpu_plan, paths, "docker-rootfs"
+        )
+        if self.resume is not None:
+            current, recorded = self.plan.images, self.resume.plan.images
+            if (current.base_digest, current.work_digest, current.judge_digest) != (
+                recorded.base_digest,
+                recorded.work_digest,
+                recorded.judge_digest,
+            ):
+                raise SetupError(
+                    f"the task's images changed since run {run_id} started"
+                )
+            try:
+                retained = self.client.images.get(self.resume.base_image_ref).id
+            except NotFound:
+                retained = None
+            if retained != self.resume.base_image_id:
+                raise SetupError("retained Work image differs from the run's lease")
+        # The run plan records the Judge image this run really uses: a public
+        # Judge always the clean image, a hidden one unless it is unavailable.
+        verifier = self.plan.task.verifier
+        clean_image = verifier.visibility == "public" or (
+            verifier.clean_image and clean_judge_unavailable(images) is None
+        )
+        if clean_image is not verifier.clean_image:
+            self.plan = self.plan.model_copy(
+                update={
+                    "task": self.plan.task.model_copy(
+                        update={
+                            "verifier": verifier.model_copy(
+                                update={"clean_image": clean_image}
+                            )
+                        }
+                    )
+                }
+            )
+        if self.sandbox_lifecycle.enabled:
+            if self._sandbox_grant is None:
+                raise SetupError(
+                    "sandbox reservation was not established before parent setup"
+                )
+            self.plan = self.plan.model_copy(update={"sandbox": self._sandbox_grant})
+            if self._sandbox_broker is None:
+                if self._sandbox_broker_factory is None:
+                    raise SetupError("sandbox broker was not bound to the lease")
+                # The run-owned sandbox root is private before the env
+                # broker creates its spool below it.
+                (run_root / "sb").mkdir(mode=0o700)
+                self._sandbox_broker = self._sandbox_broker_factory()
+            self.sandbox_lifecycle.configure(
+                self._sandbox_broker,
+                run_root / "sb",
+                run_id,
+                self.plan.task.task_id,
+            )
+            self.sandbox_lifecycle.prepare_work()
+        self.definition = self.plan.task
+        metadata_staging = run_root / "rsi-loop-task"
+        metadata = self.compiler.write_rsi_loop_metadata(
+            self.plan.task, metadata_staging
+        )
+        generated = self.data_root / "generated-tasks"
+        generated.mkdir(parents=True, exist_ok=True)
+        target = generated / f"{self.plan.task.task_id}.json"
+        temporary = generated / f".{self.plan.task.task_id}.{run_id}.tmp"
+        temporary.write_bytes(metadata.read_bytes())
+        os.replace(temporary, target)
+        self.enforcer = NetworkPolicyEnforcer(
+            run_id=run_id,
+            firewall=self.firewall,
+            engine_destinations=(self.bridge_gateway,),
+        )
+        return self.plan
+
+    def start_artifacts(self, plan: Any, run_id: str) -> RunArtifactWriter:
+        self.artifacts = RunArtifactWriter(plan, run_id=run_id)
+        if self.resume is None:
+            self.artifacts.start()
+        else:
+            self.artifacts.reopen(self.resume.attempt)
+        return self.artifacts
+
+    def start_server(self, evaluator: Any, artifacts: Any, clock: Any) -> Any:
+        self.started_server = EmbeddedSubmissionServerFactory(
+            bind_host=self.bind_host,
+            port=0,
+            bridge_gateway=self.bridge_gateway,
+        )(evaluator, artifacts, clock)
+        return self.started_server
+
+    def _runtime_common(self, role: str) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "task_id": self.definition.task_id,
+            "role": role,
+            "task_source_dir": self.definition.source_dir,
+            "allowed_mount_roots": (self.data_root, self.logs_root),
+            "omit_gpu_device_requests_for_tests": self.omit_gpu,
+        }
+
+    def plan_network(self, plan: Any, run_id: str) -> str:
+        del plan, run_id
+        self.work_provisioner = DockerContainerRuntime(
+            self.client, **self._runtime_common("work")
+        )
+        self.planned_work_network = self.work_provisioner.planned_network_name("phase")
+        return self.planned_work_network
+
+    def create_network(self, plan: Any, run_id: str, planned: str) -> ManagedNetwork:
+        del plan, run_id
+        if self.work_provisioner is None:
+            raise RuntimeError("Work network was not planned")
+        if planned != self.planned_work_network:
+            raise SetupError("Work network durable plan identity mismatch")
+        network = self.work_provisioner.create_network("phase", internal=False)
+        # Return immediately after the external mutation. The coordinator must
+        # record the actual identity before any fallible post-create setup.
+        self.work_network = network
+        return network
+
+    def remove_network(self, network: ManagedNetwork) -> None:
+        if self.work_provisioner is None:
+            raise RuntimeError("Work network provisioner is unavailable")
+        self.work_provisioner.remove_network(network)
+        if self.work_network == network:
+            self.work_network = None
+
+    def plan_workdir_volume(
+        self, plan: Any, run_id: str
+    ) -> ManagedWorkdirVolume | None:
+        if plan.rootfs_snapshot_mode is RootfsSnapshotMode.FULL_ROOTFS:
+            return None
+        if plan.rootfs_snapshot_mode is not RootfsSnapshotMode.SPLIT_WORKDIR:
+            raise SetupError("unsupported rootfs snapshot mode")
+        planned = self.workdir_volumes.plan(
+            run_id=run_id,
+            task_id=plan.task.task_id,
+            target=plan.workdir,
+        )
+        self.planned_workdir_volume = planned
+        return planned
+
+    def create_workdir_volume(
+        self,
+        plan: Any,
+        run_id: str,
+        planned: ManagedWorkdirVolume,
+    ) -> ManagedWorkdirVolume:
+        if plan.rootfs_snapshot_mode is not RootfsSnapshotMode.SPLIT_WORKDIR:
+            raise SetupError(
+                "managed WORKDIR volume creation requires split-workdir mode"
+            )
+        if planned != self.planned_workdir_volume:
+            raise SetupError("WORKDIR volume durable plan identity mismatch")
+        if (
+            planned.run_id != run_id
+            or planned.task_id != plan.task.task_id
+            or planned.target != plan.workdir
+            or planned.snapshot_mode is not plan.rootfs_snapshot_mode
+        ):
+            raise SetupError("WORKDIR volume durable plan provenance mismatch")
+        actual = self.workdir_volumes.create(planned)
+        self.workdir_volume = actual
+        return actual
+
+    def adopt_workdir_volume(
+        self, plan: Any, run_id: str, volume: ManagedWorkdirVolume
+    ) -> ManagedWorkdirVolume:
+        """Prove a resumed run's kept WORKDIR volume, unreferenced, as Work's."""
+        if (
+            volume.run_id != run_id
+            or volume.task_id != plan.task.task_id
+            or volume.target != plan.workdir
+            or volume.snapshot_mode is not plan.rootfs_snapshot_mode
+        ):
+            raise SetupError("kept WORKDIR volume provenance differs from the run")
+        actual = self.workdir_volumes.inspect(volume, expected_references=())
+        self.planned_workdir_volume = actual
+        self.workdir_volume = actual
+        return actual
+
+    def remove_workdir_volume(self, volume: ManagedWorkdirVolume) -> None:
+        if self.workdir_volume != volume:
+            raise SetupError("WORKDIR volume cleanup identity mismatch")
+        self.workdir_volumes.remove(volume)
+        self.workdir_volume = None
+        self.planned_workdir_volume = None
+
+    def attest_workdir_volume(
+        self, work: ContainerRef, volume: ManagedWorkdirVolume
+    ) -> None:
+        if self.workdir_volume != volume:
+            raise InfrastructureError(
+                "recovery_required: Work WORKDIR mount attestation authority "
+                "differs from the created volume"
+            )
+        if self.work_runtime is None:
+            raise InfrastructureError(
+                "recovery_required: Work runtime is unavailable for mount attestation"
+            )
+        self.work_runtime.attest_workdir_volume_mount(
+            work,
+            ContainerVolumeMount(
+                volume=volume,
+                target=volume.target,
+                read_only=False,
+            ),
+        )
+
+    def plan_work_container(self, plan: Any, run_id: str) -> str:
+        del run_id
+        if self.work_network is None or self.planned_work_network is None:
+            raise RuntimeError("Work network actual authority is unavailable")
+        if self.work_network.name != self.planned_work_network:
+            raise SetupError("created Work network differs from durable plan")
+        if self.enforcer is None:
+            raise RuntimeError("network enforcer was not initialized")
+        if self.artifacts is None:
+            raise RuntimeError("Work feedback artifacts were not initialized")
+        endpoint = self.sandbox_lifecycle.prepare_work()
+        self.work_runtime = DockerContainerRuntime(
+            self.client,
+            **self._runtime_common("work"),
+            network=self.work_network,
+            network_policy_enforcer=self.enforcer,
+            staging_dir=self.data_root / self.run_id / "staging",
+            work_feedback_dir=self._work_feedback_dir(plan),
+            **({"sandbox_socket_dir": endpoint.directory} if endpoint else {}),
+            work_public_tests=plan.task.verifier.visibility == "public",
+        )
+        try:
+            self.agent = self.agent_adapter_factory(
+                self.rsi_loop_config, self.work_runtime
+            )
+        except Exception as error:
+            raise self._agent_failure(error) from None
+        return self.work_runtime.planned_container_name("main")
+
+    def create_work(
+        self,
+        plan: Any,
+        run_id: str,
+        network: ManagedNetwork,
+        planned_name: str,
+        workdir_volume: ManagedWorkdirVolume | None,
+    ) -> ContainerRef:
+        del run_id, network
+        try:
+            environment = self._resolved_agent_environment(plan)
+        except MissingRuntimeEnvironmentError as error:
+            raise self._agent_failure(
+                InfrastructureError(
+                    f"missing Agent runtime environment variable '{error.name}'"
+                )
+            ) from None
+        container_environment = {
+            key: environment[key]
+            for key, template in plan.task.agent.environment
+            if key != NVIDIA_VISIBLE_DEVICES_ENV
+            and runtime_template_name(template) is None
+        }
+        container_environment.setdefault("HOME", "/home/agent")
+        try:
+            if self.work_runtime is None or self.artifacts is None:
+                raise RuntimeError("Work runtime feedback authority is unavailable")
+            if plan.rootfs_snapshot_mode is RootfsSnapshotMode.SPLIT_WORKDIR:
+                if (
+                    workdir_volume is None
+                    or workdir_volume != self.workdir_volume
+                    or workdir_volume.target != plan.workdir
+                ):
+                    raise SetupError(
+                        "split-workdir Work requires exact managed volume authority"
+                    )
+            elif (
+                plan.rootfs_snapshot_mode is RootfsSnapshotMode.FULL_ROOTFS
+                and workdir_volume is not None
+            ):
+                raise SetupError(
+                    "full-rootfs Work cannot carry WORKDIR volume authority"
+                )
+            volume_mounts = (
+                (
+                    ContainerVolumeMount(
+                        volume=workdir_volume,
+                        target=plan.workdir,
+                        read_only=False,
+                        no_copy=self.resume is not None,
+                    ),
+                )
+                if plan.rootfs_snapshot_mode is RootfsSnapshotMode.SPLIT_WORKDIR
+                else ()
+            )
+            tests_mounts: tuple[ContainerMount, ...] = ()
+            if plan.task.verifier.visibility == "public":
+                # Work reads the same tests the Judge later runs, proven
+                # against the digest recorded in the run plan.
+                tests_dir = plan.task.source_dir / "tests"
+                require_tests_digest(tests_dir, plan.task.tests_digest)
+                tests_mounts = (
+                    ContainerMount(
+                        source=tests_dir,
+                        target=PurePosixPath("/tests"),
+                        read_only=True,
+                    ),
+                )
+            self.work_public_tests = bool(tests_mounts)
+            # A resumed run's Work is its retained image, proven in prepare_plan.
+            image = (
+                plan.images.work_ref
+                if self.resume is None
+                else self.resume.base_image_ref
+            )
+            endpoint = self.sandbox_lifecycle.prepare_work()
+            return self.work_runtime.create(
+                ContainerSpec(
+                    image=image,
+                    command=("sleep", "infinity"),
+                    workdir=plan.workdir,
+                    user="0",
+                    environment=tuple(sorted(container_environment.items())),
+                    # Match the firewall's pinned service IPs without requiring
+                    # external DNS from a no-network Work container.
+                    extra_hosts=tuple(
+                        dict.fromkeys(
+                            (endpoint.hostname, str(address))
+                            for endpoint in self.api_endpoints
+                            for address in endpoint.addresses
+                        )
+                    ),
+                    # Its bridge routes to the pinned endpoints, so keep
+                    # Docker's resolver from forwarding other names out.
+                    dns=no_network_dns_servers(
+                        plan.task.agent.network.mode, bool(self.api_endpoints)
+                    ),
+                    mounts=(
+                        ContainerMount(
+                            source=self._work_feedback_dir(plan),
+                            target=WORK_FEEDBACK_ROOT,
+                            read_only=True,
+                        ),
+                    )
+                    + tests_mounts
+                    + ((endpoint.mount,) if endpoint else ()),
+                    volume_mounts=volume_mounts,
+                    tmpfs=(
+                        tuple(mount.tmpfs for mount in self.agent_auth.mounts)
+                        if self.agent_auth is not None
+                        else ()
+                    ),
+                    gpu_allocation=plan.gpu_plan.work,
+                    shm_size=plan.task.service.shm_size,
+                    cpus=plan.task.service.cpus,
+                    memory_mb=plan.task.service.memory_mb,
+                    storage_mb=plan.task.service.storage_mb,
+                ),
+                planned_name=planned_name,
+            )
+        except Exception as error:
+            raise self._agent_failure(error) from None
+
+    def _work_feedback_dir(self, plan: Any) -> Path:
+        """What Work sees at /run/rsi-harness/feedback: the run's feedback
+        logs, or in a final-judge run an empty directory, so no attempt reads
+        an earlier attempt's Judge output."""
+        if self.artifacts is None:
+            raise RuntimeError("Work feedback artifacts were not initialized")
+        if not plan.task.verifier.final_judge:
+            return self.artifacts.feedback_root
+        empty = self.data_root / self.run_id / "final-judge-feedback"
+        empty.mkdir(mode=0o755, exist_ok=True)
+        empty.chmod(0o755)
+        if any(empty.iterdir()):
+            raise SetupError(f"{empty} must be empty")
+        return empty
+
+    def attest_work_feedback_mount(self, work: ContainerRef) -> None:
+        if self.work_runtime is None:
+            raise InfrastructureError(
+                "recovery_required: Work runtime is unavailable for feedback "
+                "mount attestation"
+            )
+        self.work_runtime.attest_work_feedback_mount(work)
+        if self.work_public_tests:
+            self.work_runtime.attest_work_tests_mount(work)
+
+    def _control_endpoint(self) -> tuple[str, ...]:
+        if self.started_server is None:
+            raise RuntimeError("submission server was not started")
+        return (self.started_server.endpoint.url,)
+
+    def _api_endpoints(self) -> tuple[PinnedEndpoint, ...]:
+        return self.api_endpoints
+
+    def plan_work_policy(
+        self, plan: Any, work: ContainerRef, network: ManagedNetwork
+    ) -> str:
+        if self.enforcer is None:
+            raise RuntimeError("network enforcer is unavailable")
+        self.planned_work_policy = self.enforcer.plan(
+            work,
+            plan.task.agent.network,
+            network=network,
+            api_endpoints=self._api_endpoints(),
+            control_endpoints=self._control_endpoint(),
+        )
+        return self.planned_work_policy.rule_id
+
+    def install_work_policy(
+        self, plan: Any, work: ContainerRef, network: ManagedNetwork
+    ) -> str:
+        if self.enforcer is None or self.work_runtime is None:
+            raise RuntimeError("Work policy runtime is unavailable")
+        if self.planned_work_policy is None:
+            raise RuntimeError("Work policy was not planned")
+        lease = self.enforcer.apply(
+            work,
+            plan.task.agent.network,
+            network=network,
+            api_endpoints=self._api_endpoints(),
+            control_endpoints=self._control_endpoint(),
+            planned=self.planned_work_policy,
+        )
+        try:
+            self.work_runtime.install_network_policy(work, lease)
+        except BaseException as primary:
+            try:
+                self.enforcer.cleanup(lease)
+            except BaseException as rollback_error:
+                raise InfrastructureError(
+                    "recovery_required: installed Work network policy rollback "
+                    f"is unproven for {lease.rule_id}: "
+                    f"{redact_text(str(rollback_error))}"
+                ) from primary
+            raise
+        return lease.rule_id
+
+    def remove_work_policy(self, rule_id: str) -> None:
+        if self.enforcer is None or self.planned_work_policy is None:
+            raise RuntimeError("Work policy is unavailable")
+        if self.planned_work_policy.rule_id != rule_id:
+            raise SetupError("Work policy cleanup identity mismatch")
+        self.enforcer.cleanup(self.planned_work_policy)
+
+    def start_work(self, work: ContainerRef) -> None:
+        if self.work_runtime is None:
+            raise RuntimeError("Work runtime is unavailable")
+        self.work_runtime.start(work)
+        self.event_callback("work_started", work.container_id)
+
+    def remove_work(self, work: ContainerRef) -> None:
+        if self.work_runtime is None:
+            raise RuntimeError("Work runtime is unavailable")
+        self.work_runtime.remove(work)
+
+    def install_hooks(
+        self, plan: Any, work: ContainerRef, submit_url: str, token: str
+    ) -> None:
+        self.agent_output_secrets.update((submit_url, token))
+        try:
+            if self.agent is None or self.work_runtime is None:
+                raise RuntimeError("Agent adapter is unavailable")
+            self.agent.install_hooks(
+                AgentHookRequest(
+                    run_plan=plan,
+                    container=work,
+                    submit_url=submit_url,
+                    token=token,
+                )
+            )
+            if self.agent_auth is not None:
+                self.work_runtime.inject_agent_auth(work, self.agent_auth)
+        except Exception as error:
+            raise self._agent_failure(error) from None
+
+    def prepare_agent(self, plan: Any, max_submissions: int | None = None) -> Any:
+        try:
+            if self.agent is None or self.artifacts is None:
+                raise RuntimeError("Agent artifacts are unavailable")
+            prepared = self.agent.prepare(
+                AgentPrepareRequest(
+                    run_plan=plan,
+                    prompt_path=self.artifacts.root / "agent_prompt.md",
+                    max_submissions=max_submissions,
+                    resume=(
+                        None
+                        if self.resume is None
+                        else AgentResume(
+                            attempt=self.resume.attempt,
+                            message=self.resume.message,
+                            agent_output=self.artifacts.root / "agent_output.txt",
+                            seconds_left=self.resume.agent_seconds_left,
+                        )
+                    ),
+                )
+            )
+            resolved = self._resolved_agent_environment(plan)
+            exec_environment = {
+                key: resolved[key]
+                for key, template in plan.task.agent.environment
+                if key != NVIDIA_VISIBLE_DEVICES_ENV
+                and runtime_template_name(template) is not None
+            }
+            exec_environment.update(prepared.environment)
+            exec_environment[NVIDIA_VISIBLE_DEVICES_ENV] = nvidia_visible_devices_value(
+                plan.gpu_plan.work
+            )
+            endpoint = self.sandbox_lifecycle.prepare_work()
+            if endpoint is not None:
+                previous_path = exec_environment.get("PATH", resolved.get("PATH"))
+                exec_environment.update(endpoint.environment)
+                if previous_path is not None:
+                    exec_environment["PATH"] = previous_path
+                self.agent_output_secrets.add(endpoint.environment["RSI_SANDBOX_TOKEN"])
+            return replace(
+                prepared,
+                environment=tuple(sorted(exec_environment.items())),
+            )
+        except Exception as error:
+            raise self._agent_failure(error) from None
+
+    def _resolved_agent_environment(self, plan: Any) -> dict[str, str]:
+        environment = resolve_runtime_environment(
+            tuple(
+                (key, value)
+                for key, value in plan.task.agent.environment
+                if key != NVIDIA_VISIBLE_DEVICES_ENV
+            ),
+            self.agent_secret_env,
+        )
+        secret_names = set(plan.task.agent.secret_env_names)
+        self.agent_output_secrets.update(
+            environment[key]
+            for key, template in plan.task.agent.environment
+            if key != NVIDIA_VISIBLE_DEVICES_ENV
+            and runtime_template_name(template) in secret_names
+            and environment[key]
+        )
+        return environment
+
+    def run_agent(
+        self, prepared: Any, work: ContainerRef, timeout: float | None
+    ) -> AgentRunResult:
+        try:
+            if self.agent is None or self.artifacts is None:
+                raise RuntimeError("Agent runtime is unavailable")
+            if self.sandbox_lifecycle.enabled and timeout is None:
+                raise SetupError("sandbox requires a finite Work execution timeout")
+            agent_name = getattr(prepared, "agent_name", None)
+            if agent_name is None and self.definition is not None:
+                agent_name = self.definition.agent.name
+            self.event_callback(
+                "agent_started",
+                {
+                    "name": agent_name or "Agent",
+                    "timeout_seconds": timeout,
+                    "output_path": self.artifacts.root / "agent_output.txt",
+                },
+            )
+            result = self.agent.run(
+                AgentRunRequest(
+                    prepared=prepared,
+                    container=work,
+                    timeout_seconds=timeout,
+                    output_path=self.artifacts.root / "agent_output.txt",
+                    output_redact_values=tuple(sorted(self.agent_output_secrets)),
+                    output_callback=lambda value: self.event_callback(
+                        "agent_output", value
+                    ),
+                    on_exec_start=(
+                        self.sandbox_lifecycle.activate_work
+                        if self.sandbox_lifecycle.enabled
+                        else None
+                    ),
+                )
+            )
+            safe_output = redact_text(
+                redact_exact_values(result.output, self.agent_output_secrets)
+            )
+            safe_result = AgentRunResult(
+                exit_code=result.exit_code,
+                output=safe_output,
+                timed_out=result.timed_out,
+                output_truncated=result.output_truncated,
+                full_output_captured=result.full_output_captured,
+                cancelled=result.cancelled,
+                exec_started=result.exec_started,
+                provider_error=result.provider_error,
+                provider_retries=result.provider_retries,
+                provider_wait_seconds=result.provider_wait_seconds,
+            )
+            if not result.full_output_captured:
+                with self.artifacts.root.joinpath("agent_output.txt").open(
+                    "w" if self.resume is None else "a"
+                ) as stream:
+                    stream.write(safe_output)
+            self.artifacts.root.joinpath("run_agent.log").write_text(safe_output)
+            self.event_callback(
+                "agent_finished",
+                {
+                    "exit_code": result.exit_code,
+                    "timed_out": result.timed_out,
+                    "cancelled": result.cancelled,
+                    **(
+                        {}
+                        if result.provider_error is None
+                        else {
+                            "stopped_by": describe_provider_stop(
+                                result.provider_error, result.provider_retries
+                            )
+                        }
+                    ),
+                },
+            )
+        except Exception as error:
+            raise self._agent_failure(error) from None
+        cleanup_error = self._clear_agent_bindings()
+        if cleanup_error is not None:
+            raise cleanup_error from None
+        return safe_result
+
+    def stop_agent(self, work: ContainerRef) -> None:
+        try:
+            if self.work_runtime is None:
+                raise RuntimeError("Work runtime is unavailable")
+            self.work_runtime.stop(work)
+        except Exception as error:
+            raise self._agent_failure(error) from None
+        cleanup_error = self._clear_agent_bindings()
+        if cleanup_error is not None:
+            raise cleanup_error from None
+
+    def end_agent(self, work: ContainerRef) -> None:
+        """Stop Work under a running Agent exec, which then returns; its
+        bindings stay for run_agent to clear. The round is done, so Work gets
+        no grace period to exit."""
+        try:
+            if self.work_runtime is None:
+                raise RuntimeError("Work runtime is unavailable")
+            self.work_runtime.stop(work, timeout_seconds=0)
+        except Exception as error:
+            raise self._agent_failure(error) from None
+
+    def quiesce_work(self, work: ContainerRef) -> WorkQuiescence:
+        """Pause a running Work container or prove it is already stopped."""
+        if self.work_runtime is None:
+            raise RuntimeError("Work runtime is unavailable")
+        try:
+            container = self.client.containers.get(work.container_id)
+            container.reload()
+            state = container.attrs.get("State")
+        except NotFound as error:
+            raise InfrastructureError(
+                "Work container disappeared before final retention"
+            ) from error
+        except (AttributeError, KeyError, TypeError) as error:
+            raise InfrastructureError(
+                "ambiguous Work container state before final retention"
+            ) from error
+        if not isinstance(state, dict):
+            raise InfrastructureError(
+                "ambiguous Work container state before final retention"
+            )
+        running = state.get("Running")
+        paused = state.get("Paused")
+        if not isinstance(running, bool) or not isinstance(paused, bool):
+            raise InfrastructureError(
+                "ambiguous Work container state before final retention"
+            )
+        if running is False:
+            if paused:
+                raise InfrastructureError(
+                    "ambiguous stopped and paused Work container state"
+                )
+            return WorkQuiescence.STOPPED
+        if paused:
+            return WorkQuiescence.PAUSED
+        self.work_runtime.pause(work)
+        try:
+            container.reload()
+            state = container.attrs.get("State")
+        except (APIError, AttributeError, KeyError, TypeError) as error:
+            raise InfrastructureError(
+                "ambiguous Work container state after final pause"
+            ) from error
+        if not isinstance(state, dict):
+            raise InfrastructureError(
+                "ambiguous Work container state after final pause"
+            )
+        running = state.get("Running")
+        paused = state.get("Paused")
+        if running is False and paused is False:
+            return WorkQuiescence.STOPPED
+        if running is True and paused is True:
+            return WorkQuiescence.PAUSED
+        raise InfrastructureError("ambiguous Work container state after final pause")
+
+    def plan_retained_work(self, plan: Any, work: ContainerRef) -> str:
+        del work
+        return self.rootfs_snapshots.planned_ref(
+            run_id=self.run_id,
+            task_id=plan.task.task_id,
+            round_id=retained_round_id("final", self.attempt),
+            purpose="retained-work",
+        )
+
+    def retain_work(
+        self, plan: Any, work: ContainerRef, planned_ref: str
+    ) -> RootfsSnapshotLease:
+        return self.rootfs_snapshots.acquire(
+            work,
+            run_id=self.run_id,
+            task_id=plan.task.task_id,
+            round_id=retained_round_id("final", self.attempt),
+            purpose="retained-work",
+            planned_ref=planned_ref,
+        )
+
+    def release_retained_work(self, retained: RootfsSnapshotLease) -> None:
+        self.rootfs_snapshots.release(retained)
+
+    def _agent_secret_snapshot(self) -> set[str]:
+        return {
+            *rsi_loop_runtime_secret_values(self.rsi_loop_config),
+            *self.agent_output_secrets,
+        }
+
+    def _safe_agent_error(
+        self,
+        error: BaseException,
+        *,
+        secret_values: set[str] | None = None,
+    ) -> InfrastructureError:
+        values = (
+            self._agent_secret_snapshot() if secret_values is None else secret_values
+        )
+        safe_error = redact_text(redact_exact_values(str(error), values))
+        return InfrastructureError(safe_error or type(error).__name__)
+
+    def _agent_failure(self, error: BaseException) -> InfrastructureError:
+        secret_values = self._agent_secret_snapshot()
+        primary = self._safe_agent_error(error, secret_values=secret_values)
+        cleanup = self._clear_agent_bindings(secret_values=secret_values)
+        if cleanup is None:
+            return primary
+        return InfrastructureError(
+            f"{primary}; Agent transient binding cleanup failed: {cleanup}"
+        )
+
+    def _clear_agent_bindings(
+        self, *, secret_values: set[str] | None = None
+    ) -> InfrastructureError | None:
+        values = (
+            self._agent_secret_snapshot() if secret_values is None else secret_values
+        )
+        try:
+            if self.agent is not None:
+                clear = getattr(self.agent, "clear_transient_bindings", None)
+                if callable(clear):
+                    clear()
+        except Exception as error:
+            # A custom adapter that cannot prove it dropped control authority
+            # is removed from the composition so no later stage can reuse it.
+            self.agent = None
+            return self._safe_agent_error(error, secret_values=values)
+        finally:
+            self.agent_output_secrets.clear()
+        return None
+
+    def evaluate(self, request: EvaluationRequest, observer: Any) -> SubmissionReport:
+        if self.work_runtime is None or self.enforcer is None or self.artifacts is None:
+            raise RuntimeError("Judge production composition is incomplete")
+        factory = DockerJudgeRuntimeFactory(
+            self.client,
+            run_id=self.run_id,
+            task_id=self.definition.task_id,
+            task_source_dir=self.definition.source_dir,
+            allowed_mount_roots=(self.data_root, self.logs_root),
+            network_policy_enforcer=self.enforcer,
+            lifecycle_observer=observer,
+            work_container=request.work_container,
+            omit_gpu_device_requests_for_tests=self.omit_gpu,
+            **(
+                {"model_access": self.judge_model_access}
+                if self.judge_model_access is not None
+                else {}
+            ),
+            **(
+                {"sandbox_lifecycle": self.sandbox_lifecycle}
+                if self.sandbox_lifecycle.enabled
+                else {}
+            ),
+        )
+        self.event_callback("judge_started", {"round_id": request.round_id})
+        runner = JudgeRunner(
+            run_id=self.run_id,
+            workdir_volume=self.workdir_volume,
+            work_runtime=self.work_runtime,
+            judge_runtime_factory=factory,
+            snapshot_backend=self.rootfs_snapshots,
+            artifact_writer=self.artifacts,
+            quiescence_checker=self.quiescence_checker,
+            lifecycle_observer=observer,
+            verifier_secret_env=self.verifier_secret_env,
+            event_callback=self.event_callback,
+            special_file_check=self.workdir_volumes.special_files,
+            **(
+                {"model_access": self.judge_model_access}
+                if self.judge_model_access is not None
+                else {}
+            ),
+            **(
+                {"sandbox_lifecycle": self.sandbox_lifecycle}
+                if self.sandbox_lifecycle.enabled
+                else {}
+            ),
+        )
+        try:
+            report = runner.evaluate(request)
+        finally:
+            # The next round checks Work's login against this round's copy;
+            # Work's Agent output may print the renewed tokens too.
+            if runner.model_access is not None:
+                self.judge_model_access = runner.model_access
+                self.agent_output_secrets.update(runner.model_access.secret_values)
+        self.event_callback(
+            "judge_finished",
+            {
+                "round_id": report.round_id,
+                "status": report.status.value,
+                "score": report.score,
+                "runtime_seconds": report.duration_seconds,
+            },
+        )
+        return report
+
+
+class ProductionRuntimeServices:
+    """Application service used by the CLI; all defaults are production ports."""
+
+    def __init__(
+        self,
+        *,
+        data_root: Path,
+        logs_root: Path,
+        docker_client: Any | None = None,
+        inventory: Any | None = None,
+        rsi_loop_config: RSILoopConfig | None = None,
+        snapshot_backend: Any | None = None,
+        firewall_backend: Any | None = None,
+        coordinator_factory: Callable[..., Any] = RunCoordinator,
+        bind_host: str = "0.0.0.0",
+        bridge_gateway: str | None = None,
+        omit_gpu_device_requests_for_tests: bool = False,
+        agent_adapter_factory: Callable[[RSILoopConfig, Any], Any] | None = None,
+        quiescence_checker: Callable[[Any, ContainerRef], None] | None = None,
+        engine_config: EngineConfig | None = None,
+        event_callback: Callable[[str, object], None] | None = None,
+    ) -> None:
+        self.data_root = Path(data_root).expanduser().resolve()
+        self.logs_root = Path(logs_root).expanduser().resolve()
+        self.client = docker_client
+        self.inventory = inventory or NvidiaSmiInventory()
+        self.rsi_loop_config = rsi_loop_config or load_config()
+        self.snapshot = snapshot_backend
+        self.firewall = firewall_backend
+        self.coordinator_factory = coordinator_factory
+        self.bind_host = bind_host
+        self.bridge_gateway = bridge_gateway
+        self.omit_gpu = omit_gpu_device_requests_for_tests
+        self.agent_adapter_factory = agent_adapter_factory or (
+            lambda config, runtime: RSILoopAgentAdapter(config, runtime=runtime)
+        )
+        self.quiescence_checker = quiescence_checker
+        self.event_callback = event_callback
+        configured_agent_env = {} if engine_config is None else engine_config.secret_env
+        self.sandbox_policy = (
+            None if engine_config is None else engine_config.sandbox_policy
+        )
+        self.sandbox_policy_path = (
+            None if engine_config is None else engine_config.sandbox_policy_path
+        )
+        configured_verifier_env = (
+            {} if engine_config is None else engine_config.verifier_secret_env
+        )
+        self.agent_secret_env = {**os.environ, **configured_agent_env}
+        self.verifier_secret_env = {**os.environ, **configured_verifier_env}
+
+    def _client(self) -> Any:
+        if self.client is None:
+            self.client = docker.from_env(timeout=DOCKER_API_TIMEOUT_SECONDS)
+            self.client.ping()
+        return self.client
+
+    def _gateway(self, client: Any) -> str:
+        if self.bridge_gateway is not None:
+            return self.bridge_gateway
+        if is_desktop(client):
+            return DesktopHost(client).gateway()
+        try:
+            configs = client.networks.get("bridge").attrs["IPAM"]["Config"]
+            gateway = next(
+                str(item["Gateway"]) for item in configs if item.get("Gateway")
+            )
+        except Exception as error:
+            raise SetupError(
+                f"cannot resolve Docker host bridge gateway: {error}"
+            ) from error
+        return gateway
+
+    def available_agents(self) -> tuple[str, ...]:
+        return RSILoopAgentAdapter(self.rsi_loop_config).available_agents()
+
+    def run(self, request: RunRequest) -> RunResult:
+        return self._run(request)
+
+    def plan_resume(
+        self, run_id: str, grants: AttemptGrants, *, dry_run: bool = False
+    ) -> ResumeContext:
+        """Plan the run's next attempt; a dry run changes nothing."""
+        return plan_resume(
+            run_id,
+            store=LeaseStore(self.data_root / "leases"),
+            data_root=self.data_root,
+            logs_root=self.logs_root,
+            grants=grants,
+            compile_task=lambda request: HarborTaskCompiler().compile(
+                request.task_dir, request.options
+            ),
+            salvage=(
+                None if dry_run else lambda selected: self._recovery().salvage(selected)
+            ),
+        )
+
+    def resume(self, context: ResumeContext) -> RunResult:
+        """Run the planned attempt with the run's own request and policy."""
+        source = context.sandbox_policy
+        if source is not None:
+            if hashlib.sha256(source.path.read_bytes()).hexdigest() != source.sha256:
+                raise SetupError(
+                    f"sandbox policy {source.path} changed since the run started"
+                )
+            self.sandbox_policy = load_sandbox_policy(source.path)
+            self.sandbox_policy_path = source.path
+        return self._run(context.request, resume=context)
+
+    def _run(
+        self, request: RunRequest, *, resume: ResumeContext | None = None
+    ) -> RunResult:
+        # Static Harbor validation is deliberately outside the coordinator so
+        # an unsupported local task cannot create the data root, contact
+        # Docker, or be collapsed into a generic terminal result.
+        compiler = HarborTaskCompiler()
+        definition = compiler.compile(request.task_dir, request.options)
+        validate_sandbox_policy(definition.sandbox, self.sandbox_policy, "docker")
+        validate_agent_reasoning_effort(definition.agent.name, request.reasoning_effort)
+        agent_updates = {}
+        if request.model is not None:
+            agent_updates["model"] = request.model
+        if request.reasoning_effort is not None:
+            agent_updates["reasoning_effort"] = request.reasoning_effort
+        if agent_updates:
+            definition = definition.model_copy(
+                update={"agent": definition.agent.model_copy(update=agent_updates)}
+            )
+        config = self.rsi_loop_config
+        if request.agent_auth == AgentAuthSource.LOCAL and not config.agent_api_key:
+            # The Agent launches on the login; an API key wins over it.
+            config = replace(config, agent_local_auth=True)
+        selected_agent = validate_agent_config(
+            config,
+            definition.agent.name,
+            model=definition.agent.model,
+        )
+        if getattr(selected_agent, "runs_task_solution", False):
+            task_solution_script(definition.source_dir)
+            if request.agent_auth is not None:
+                raise SetupError(
+                    f"the {selected_agent.name} Agent uses no credential; "
+                    "drop --agent-auth"
+                )
+            if definition.verifier.model_access:
+                raise SetupError(
+                    "the task's Judge has model_access and calls the run's "
+                    f"Agent; the {selected_agent.name} Agent has none"
+                )
+        client = None
+        if sys.platform == "darwin":
+            # Mac capability refusal precedes Linux-only inventory access.
+            # Linux keeps static resource/auth checks ahead of daemon contact.
+            client = self._client()
+            validate_local_daemon(client)
+            validate_desktop_task(definition, None)
+        needs_gpus = (
+            definition.gpu_requirement.count != 0 or definition.verifier.gpu_count != 0
+        )
+        gpu_plan = resolve_gpu_plan(
+            definition.gpu_requirement,
+            judge_count=definition.verifier.gpu_count,
+            requested=request.gpu_selectors,
+            inventory=self.inventory.list_devices() if needs_gpus else (),
+        )
+        if (
+            resume is not None
+            and resume.gpu_plan is not None
+            and not same_gpu_shape(gpu_plan, resume.gpu_plan)
+        ):
+            raise SetupError(
+                "a resumed run keeps its GPU count and Judge GPU mode; "
+                "--gpus may only choose other GPUs"
+            )
+        preparation = RunPreparation(
+            request=request,
+            definition=definition,
+            gpu_plan=gpu_plan,
+        )
+        agent_auth = resolve_agent_auth(
+            source=request.agent_auth,
+            agent_name=definition.agent.name,
+            agent_api_key=config.agent_api_key,
+        )
+        api_endpoints = _agent_endpoints(definition, config, agent_auth)
+        # Before the Agent starts: a task's Judge LLM needs a usable credential.
+        judge_llm = resolve_judge_llm(
+            definition,
+            request.judge_llm,
+            config,
+            agent_auth,
+            pin=lambda endpoints: _pin_ipv4_endpoints(endpoints, "Judge LLM"),
+            environ=self.verifier_secret_env,
+        )
+        judge_model_access = resolve_judge_model_access(
+            definition, config, agent_auth, api_endpoints, judge_llm
+        )
+        if self.event_callback is not None and judge_llm is not None:
+            self.event_callback(
+                "judge_llm",
+                {
+                    "model": judge_llm.model,
+                    "effort": judge_llm.effort,
+                    "credential": judge_llm.kind.value,
+                    "reused": judge_llm.reused,
+                    "expires_at": judge_llm.expires_at,
+                },
+            )
+        elif self.event_callback is not None and request.judge_llm is not None:
+            self.event_callback("judge_llm_ignored", None)
+        if client is None:
+            client = self._client()
+        if _check_docker_resource_limits(
+            client,
+            definition.service,
+            holders=container_netns_firewall_selected(),
+        ):
+            # Docker drops the limit and runs the containers without it.
+            self.event_callback(
+                "docker_memory_limit_unsupported", definition.service.memory_mb
+            )
+        if is_desktop(client):
+            validate_desktop_task(definition, judge_llm)
+        snapshot = self.snapshot or OverlaySnapshotBackend(self.data_root)
+        firewall = self.firewall or run_firewall(client, definition)
+        if self.event_callback is not None and getattr(
+            firewall, "container_netns", False
+        ):
+            self.event_callback("network_policy", {"backend": "container-namespace"})
+        ports = _ProductionRunComposition(
+            client=client,
+            data_root=self.data_root,
+            logs_root=self.logs_root,
+            inventory=self.inventory,
+            rsi_loop_config=config,
+            snapshot=snapshot,
+            firewall=firewall,
+            bind_host=self.bind_host,
+            bridge_gateway=self._gateway(client),
+            omit_gpu_device_requests_for_tests=self.omit_gpu,
+            agent_adapter_factory=self.agent_adapter_factory,
+            quiescence_checker=self.quiescence_checker,
+            api_endpoints=api_endpoints,
+            agent_secret_env=self.agent_secret_env,
+            verifier_secret_env=self.verifier_secret_env,
+            agent_auth=agent_auth,
+            judge_model_access=judge_model_access,
+            event_callback=self.event_callback,
+            preparation=preparation,
+            compiler=compiler,
+            **({"sandbox_policy": self.sandbox_policy} if definition.sandbox else {}),
+            sandbox_policy_path=self.sandbox_policy_path,
+            resume=resume,
+        )
+        coordinator = self.coordinator_factory(
+            backend=ports.backend(),
+            lease_store=LeaseStore(self.data_root / "leases"),
+            clock=_Clock(),
+            **(
+                {}
+                if resume is None
+                else {"run_id_factory": lambda: resume.run_id, "resume": resume}
+            ),
+            **(
+                {
+                    "on_lease_ready": ports.bind_sandbox_lease,
+                    "sandbox_lifecycle": ports.sandbox_lifecycle,
+                }
+                if definition.sandbox
+                else {}
+            ),
+        )
+        return coordinator.run(request)
+
+    def _recovery(self) -> RecoveryManager:
+        client = self._client()
+        validate_local_daemon(client)
+        snapshot = self.snapshot or OverlaySnapshotBackend(self.data_root)
+        firewall = self.firewall or recovery_firewall(client)
+        return RecoveryManager(
+            store=LeaseStore(self.data_root / "leases"),
+            backend=ProductionRecoveryBackend(client, snapshot, firewall),
+            managed_root=self.data_root,
+        )
+
+    def recover(self, run_id: str | None) -> tuple[str, ...]:
+        return self._recovery().recover(run_id)
+
+    def cleanup(self, run_id: str, *, delete_workspace: bool) -> None:
+        self._recovery().cleanup(run_id, delete_workspace=delete_workspace)
+
+    def prune_images(
+        self,
+        *,
+        older_than_seconds: float | None,
+        dry_run: bool,
+        confirm: Callable[[tuple[PruneRow, ...]], bool],
+    ) -> tuple[PruneRow, ...] | None:
+        """Remove the pulled images the host pull ledger names (sandbox_ledger)."""
+        pruner = ImagePruner(
+            PullLedger(pull_ledger_root(self.data_root)),
+            LeaseStore(self.data_root / "leases"),
+            self._client().api,
+        )
+        return pruner.run(older_than_seconds, dry_run=dry_run, confirm=confirm)
+
+
+__all__ = ["ProductionRecoveryBackend", "ProductionRuntimeServices"]

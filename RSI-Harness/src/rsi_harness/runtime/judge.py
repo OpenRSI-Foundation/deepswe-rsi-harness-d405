@@ -1,0 +1,1919 @@
+"""Fresh, isolated Judge execution over a paused persistent workspace."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Any, Protocol
+
+from rsi_harness.errors import (
+    ContainerExecNotStartedError,
+    InfrastructureError,
+    RecoveryRequiredError,
+    RetryableSubmissionError,
+    SetupError,
+    StateTransitionError,
+    SubmissionError,
+)
+from rsi_harness.judge_agent import (
+    JUDGE_AGENT_CODE_TARGET,
+    JUDGE_AGENT_LAUNCHER,
+    JUDGE_AGENT_LAUNCHER_TARGET,
+    JUDGE_AGENT_TMPFS,
+    JUDGE_CODEX_TARGET,
+    JUDGE_ISOLATE_CODE_TARGET,
+    JUDGE_ISOLATE_LAUNCHER,
+    JUDGE_ISOLATE_LAUNCHER_TARGET,
+    install_judge_agent,
+    install_judge_isolate,
+)
+from rsi_harness.models import (
+    JUDGE_ALLOW_MISSING_LANDLOCK_SIGNAL_ENV,
+    JUDGE_ISOLATION_FALLBACK_ENV,
+    JUDGE_NETNS_ENV,
+    JUDGE_TRAJECTORY_ROOT,
+    VERIFIER_OUTPUT_TRUNCATION_MARKER,
+    AgentRunResult,
+    ContainerMount,
+    ContainerRef,
+    ContainerSpec,
+    ContainerTmpfs,
+    ContainerVolumeMount,
+    EvaluationRequest,
+    GPUAllocation,
+    ImagePlan,
+    JudgeGPUMode,
+    ManagedNetwork,
+    ManagedWorkdirVolume,
+    NetworkPolicy,
+    RewardResult,
+    RootfsSnapshotLease,
+    RootfsSnapshotMode,
+    RunPlan,
+    SubmissionReport,
+    SubmissionStatus,
+    WorkQuiescence,
+)
+from rsi_harness.runtime.artifacts import _sudo_invoking_owner
+from rsi_harness.runtime.desktop import PrivateLogContentError
+from rsi_harness.runtime.docker import DockerContainerRuntime
+from rsi_harness.runtime.environment import (
+    MissingRuntimeEnvironmentError,
+    resolve_runtime_environment,
+    runtime_template_name,
+)
+from rsi_harness.runtime.gpu import (
+    NVIDIA_VISIBLE_DEVICES_ENV,
+    nvidia_visible_devices_value,
+)
+from rsi_harness.runtime.judge_llm import judge_codex_login
+from rsi_harness.runtime.judge_login_refresh import renew_operator_login
+from rsi_harness.runtime.judge_model_access import (
+    JudgeModelAccess,
+    judge_needs_rsi_agent,
+)
+from rsi_harness.runtime.local_auth import (
+    AgentAuthMaterial,
+    current_login,
+    login_kept_reason,
+)
+from rsi_harness.runtime.mount_topology import validate_split_workdir_target
+from rsi_harness.runtime.network import (
+    NetworkPolicyEnforcer,
+    NetworkPolicyLease,
+    PinnedEndpoint,
+    judge_requires_internal_bridge,
+    no_network_dns_servers,
+)
+from rsi_harness.runtime.redaction import redact_exact_values, redact_text
+from rsi_harness.runtime.reward import read_reward
+from rsi_harness.runtime.rootfs_snapshot import RootfsSnapshotNotCreatedError
+from rsi_harness.runtime.special_files import special_files_refusal
+from rsi_harness.runtime.trajectory import (
+    capture_round_trajectory,
+    release_round_trajectory,
+)
+from rsi_harness.task.digest import require_tests_digest
+
+VERIFIER_COMMAND = ("/bin/bash", "/tests/test.sh")
+VERIFIER_EXPECTED_GPU_UUIDS_ENV = "RSI_HARNESS_EXPECTED_GPU_UUIDS"
+OUTPUT_TRUNCATION_MARKER = VERIFIER_OUTPUT_TRUNCATION_MARKER
+# From rsi-agent's launch spec reaching the Judge to its verifier's start
+# (the tests' injection): rsi-agent's round end is this much past the timeout.
+JUDGE_ROUND_END_SLACK_SECONDS = 60
+_ROOTFS_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_JUDGE_SNAPSHOT_REF = re.compile(r"rsi-harness-rootfs:judge-round-[0-9a-f]{64}\Z")
+
+
+class _SubmissionRejected(Exception):
+    """Internal control flow for a reportable pre-pause submission error."""
+
+
+def require_model_access(
+    plan: RunPlan, model_access: JudgeModelAccess | None
+) -> JudgeModelAccess | None:
+    """Model access exists exactly when the task declared it.
+
+    That is ``model_access`` (rsi-agent exec), ``judge_model`` (rsi-agent
+    llm), or both.
+    """
+    declared = judge_needs_rsi_agent(plan.task.verifier)
+    if declared and model_access is None:
+        raise SetupError("task declares Judge model access but none was resolved")
+    if model_access is not None and not declared:
+        raise SetupError("Judge model access was supplied for a task without it")
+    if (
+        model_access is not None
+        and model_access.needs_codex_cli
+        and model_access.codex_cli is None
+    ):
+        raise SetupError("the Judge LLM needs the Codex CLI, which was not prepared")
+    return model_access
+
+
+# A public Judge's rootfs: writable only in /tmp; /tests and model
+# credentials keep their own tmpfs mounts. /tmp is noexec (Docker's tmpfs
+# default without "exec", stated here so the mount is what the docs say).
+PUBLIC_JUDGE_TMP = ContainerTmpfs(
+    target=PurePosixPath("/tmp"),
+    options="rw,nosuid,nodev,noexec,size=256m,mode=1777",
+)
+
+
+def clean_judge_unavailable(images: ImagePlan) -> str | None:
+    """Why no Judge can start from the clean Work image, or None if it can."""
+    if images.rootfs_snapshot_mode is not RootfsSnapshotMode.SPLIT_WORKDIR:
+        return "the task WORKDIR is /"
+    image = images.work_digest
+    # Defensive: the Docker image builder always records the Work image ID.
+    if image is None or _ROOTFS_IMAGE_ID.fullmatch(image) is None:
+        return "the Work image has no immutable digest"
+    return None
+
+
+def clean_judge_image(images: ImagePlan) -> str:
+    """The clean Work image a public or clean_image Judge runs from.
+
+    The Judge starts from the immutable image Work started from (the task
+    image plus the Agent CLI), never Work's rootfs, so the Agent cannot alter
+    the programs that judge it, and reads only the Work WORKDIR snapshot.
+    """
+    reason = clean_judge_unavailable(images)
+    if reason is not None:
+        raise SetupError(f"a clean-image Judge is unavailable: {reason}")
+    return str(images.work_digest)
+
+
+def judge_uses_clean_image(plan: RunPlan) -> bool:
+    """Whether this run's Judges start from the clean Work image.
+
+    A public Judge always does. A hidden one does when its plan says so: the
+    compiler records clean_image explicitly, the Docker run plan clears it
+    when the clean image is unavailable, and a plan persisted before the field
+    loads as False, the Work-snapshot Judge it started with.
+    """
+    verifier = plan.task.verifier
+    return verifier.visibility == "public" or verifier.clean_image
+
+
+def _auth_owner(user: str | None) -> str | None:
+    """The Judge user that must own injected credentials; None for root."""
+    if user is None or user.split(":", 1)[0] in {"", "0", "root"}:
+        return None
+    return user
+
+
+class WorkRuntime(Protocol):
+    def pause(self, container: ContainerRef) -> None: ...
+
+    def unpause(
+        self, container: ContainerRef, *, admission=None, control_client=None
+    ) -> None: ...
+
+    def inspect_quiescence(self, container: ContainerRef) -> WorkQuiescence | None: ...
+
+    def read_agent_auth(
+        self, container: ContainerRef, material: AgentAuthMaterial
+    ) -> Mapping[PurePosixPath, bytes]: ...
+
+
+class JudgeRoundRuntime(Protocol):
+    def create(self, spec: ContainerSpec) -> ContainerRef: ...
+
+    def start(self, container: ContainerRef) -> None: ...
+
+    def inject_tests(self, container: ContainerRef, source: Path) -> None: ...
+
+    def inject_agent_auth(
+        self,
+        container: ContainerRef,
+        material: AgentAuthMaterial,
+        *,
+        owner: str | None,
+    ) -> None: ...
+
+    def inject_judge_agent(
+        self,
+        container: ContainerRef,
+        launch: bytes,
+        *,
+        owner: str | None,
+    ) -> None: ...
+
+    def exec(
+        self,
+        container: ContainerRef,
+        command: tuple[str, ...],
+        *,
+        timeout_seconds: float | None = None,
+        environment: dict[str, str] | None = None,
+        output_path: Path | None = None,
+        deadline: float | None = None,
+        output_redact_values: tuple[str, ...] = (),
+    ) -> AgentRunResult: ...
+
+    def remove(self, container: ContainerRef) -> None: ...
+
+    def contain_after_remove_failure(self, container: ContainerRef) -> None: ...
+
+    @property
+    def safe_to_release_isolation(self) -> bool: ...
+
+    def recovery_context(self, container: ContainerRef | None = None) -> str: ...
+
+    def close(self) -> None: ...
+
+
+class RootfsSnapshotPort(Protocol):
+    def planned_ref(
+        self, *, run_id: str, task_id: str, round_id: str, purpose: str
+    ) -> str: ...
+
+    def acquire(
+        self,
+        work: ContainerRef,
+        *,
+        run_id: str,
+        task_id: str,
+        round_id: str,
+        purpose: str = "judge-round",
+        planned_ref: str | None = None,
+    ) -> RootfsSnapshotLease: ...
+
+    def release(self, lease: RootfsSnapshotLease) -> None: ...
+
+
+class ArtifactWriterPort(Protocol):
+    def record_submission(self, report: SubmissionReport) -> None: ...
+
+
+class JudgeResourceMutationObserver(Protocol):
+    """Typed durable events emitted immediately around external mutations."""
+
+    def judge_network_planned(self, round_id: str, planned_name: str) -> None: ...
+
+    def judge_network_created(self, round_id: str, network: ManagedNetwork) -> None: ...
+
+    def judge_container_planned(self, round_id: str, planned_name: str) -> None: ...
+
+    def judge_container_created(
+        self, round_id: str, container: ContainerRef
+    ) -> None: ...
+
+    def judge_policy_planned(self, round_id: str, rule_id: str) -> None: ...
+
+    def judge_policy_installed(
+        self, round_id: str, lease: NetworkPolicyLease
+    ) -> None: ...
+
+    def judge_container_removed(self, round_id: str, container_id: str) -> None: ...
+
+    def judge_policy_removed(self, round_id: str, rule_id: str) -> None: ...
+
+    def judge_network_removed(self, round_id: str, network_id: str) -> None: ...
+
+
+class DockerJudgeRoundRuntime:
+    """One container, authoritative policy lease, and private Judge bridge."""
+
+    def __init__(
+        self,
+        *,
+        runtime: DockerContainerRuntime,
+        provisioner: DockerContainerRuntime,
+        enforcer: NetworkPolicyEnforcer,
+        network: ManagedNetwork,
+        policy: NetworkPolicy,
+        round_id: str,
+        planned_container_name: str,
+        observer: JudgeResourceMutationObserver,
+        api_endpoints: tuple[PinnedEndpoint, ...] = (),
+    ) -> None:
+        self._runtime = runtime
+        self._provisioner = provisioner
+        self._enforcer = enforcer
+        self._network = network
+        self._policy = policy
+        self._round_id = round_id
+        self._planned_container_name = planned_container_name
+        self._observer = observer
+        # Model access only: the pinned Agent endpoints, the sole exception
+        # to the Judge policy's default reject.
+        self._api_endpoints = api_endpoints
+        self._lease: NetworkPolicyLease | None = None
+        self._closed = False
+        self._container: ContainerRef | None = None
+        self._safe_to_release_isolation = True
+
+    def create(self, spec: ContainerSpec) -> ContainerRef:
+        self._observer.judge_container_planned(
+            self._round_id, self._planned_container_name
+        )
+        container = self._runtime.create(
+            spec, planned_name=self._planned_container_name
+        )
+        self._container = container
+        self._safe_to_release_isolation = False
+        self._observer.judge_container_created(self._round_id, container)
+        try:
+            for mount in spec.volume_mounts:
+                self._runtime.attest_workdir_volume_mount(container, mount)
+            planned_lease = self._enforcer.plan(
+                container,
+                self._policy,
+                network=self._network,
+                api_endpoints=self._api_endpoints,
+            )
+            # Keep the planned identity in memory before installation.  If a
+            # partial install cannot roll back, recovery still has the exact
+            # rule authority even though apply() cannot return normally.
+            self._lease = planned_lease
+            lease = self._enforcer.apply(
+                container,
+                self._policy,
+                network=self._network,
+                api_endpoints=self._api_endpoints,
+                mutation_observer=self,
+                planned=planned_lease,
+            )
+            self._lease = lease
+            self._runtime.install_network_policy(container, lease)
+            return container
+        except Exception as primary:
+            typed_recovery = isinstance(primary, RecoveryRequiredError)
+            recovery_required = "recovery_required" in _error_text(primary)
+            cleanup: list[str] = []
+            try:
+                self.remove(container)
+            except Exception as error:
+                typed_recovery |= isinstance(error, RecoveryRequiredError)
+                cleanup.append(f"container removal: {_error_text(error)}")
+                try:
+                    self.contain_after_remove_failure(container)
+                except Exception as containment_error:
+                    cleanup.append(
+                        "emergency containment unproven: "
+                        f"{_error_text(containment_error)}"
+                    )
+            if (
+                self._lease is not None
+                and self._safe_to_release_isolation
+                and not typed_recovery
+            ):
+                try:
+                    self._enforcer.cleanup(self._lease)
+                except Exception as error:
+                    self._safe_to_release_isolation = False
+                    cleanup.append(
+                        "recovery_required: policy cleanup is unproven: "
+                        f"{_error_text(error)}"
+                    )
+                else:
+                    self._lease = None
+            if typed_recovery or recovery_required:
+                self._safe_to_release_isolation = False
+            detail = _combined_error(_error_text(primary), cleanup)
+            error_type = (
+                RecoveryRequiredError if typed_recovery else InfrastructureError
+            )
+            raise error_type(detail or "Judge creation failed") from primary
+
+    def start(self, container: ContainerRef) -> None:
+        self._runtime.start(container)
+
+    def inject_tests(self, container: ContainerRef, source: Path) -> None:
+        self._runtime.inject_directory(
+            container,
+            source,
+            PurePosixPath("/tests"),
+        )
+
+    def inject_agent_auth(
+        self,
+        container: ContainerRef,
+        material: AgentAuthMaterial,
+        *,
+        owner: str | None,
+    ) -> None:
+        self._runtime.inject_agent_auth(container, material, owner=owner)
+
+    def inject_judge_agent(
+        self,
+        container: ContainerRef,
+        launch: bytes,
+        *,
+        owner: str | None,
+    ) -> None:
+        self._runtime.inject_judge_agent(container, launch, owner=owner)
+
+    def exec(
+        self,
+        container: ContainerRef,
+        command: tuple[str, ...],
+        *,
+        timeout_seconds: float | None = None,
+        environment: dict[str, str] | None = None,
+        output_path: Path | None = None,
+        deadline: float | None = None,
+        output_redact_values: tuple[str, ...] = (),
+    ) -> AgentRunResult:
+        options = {} if deadline is None else {"deadline": deadline}
+        if output_redact_values:
+            options["output_redact_values"] = output_redact_values
+        result = self._runtime.exec(
+            container,
+            command,
+            timeout_seconds=timeout_seconds,
+            environment=environment,
+            output_path=output_path,
+            redact_output=False,
+            **options,
+        )
+        collector = getattr(self._runtime, "collect_private_judge_logs", None)
+        if collector is not None:
+            try:
+                collector(container)
+            except PrivateLogContentError as error:
+                # Export follows a completed exec: preserve its output-capture
+                # evidence even though none of its rewards may be accepted.
+                error.exec_result = result
+                raise
+        return result
+
+    def remove(self, container: ContainerRef) -> None:
+        self._runtime.remove(container)
+        self._safe_to_release_isolation = True
+        self._observer.judge_container_removed(self._round_id, container.container_id)
+
+    def policy_install_planned(self, rule_id: str) -> None:
+        self._observer.judge_policy_planned(self._round_id, rule_id)
+
+    def policy_installed(self, lease: NetworkPolicyLease) -> None:
+        self._observer.judge_policy_installed(self._round_id, lease)
+
+    def contain_after_remove_failure(self, container: ContainerRef) -> None:
+        stop_error: str | None = None
+        try:
+            self._runtime.stop(container)
+        except Exception as error:
+            stop_error = _error_text(error)
+        try:
+            stopped = self._runtime.is_stopped_or_gone(container)
+        except Exception as error:
+            detail = f"inspection failed: {_error_text(error)}"
+            if stop_error is not None:
+                detail = f"stop failed: {stop_error}; {detail}"
+            self._safe_to_release_isolation = False
+            raise InfrastructureError(
+                f"Judge containment is unproven: {detail}"
+            ) from error
+        if not stopped:
+            detail = "authoritative state is still running"
+            if stop_error is not None:
+                detail = f"stop failed: {stop_error}; {detail}"
+            self._safe_to_release_isolation = False
+            raise InfrastructureError(f"Judge containment is unproven: {detail}")
+        # A successful stop proves execution containment only. It cannot prove
+        # that the exact-labeled container was removed, so all dependent
+        # isolation remains durable for recovery.
+        self._safe_to_release_isolation = False
+
+    @property
+    def safe_to_release_isolation(self) -> bool:
+        return self._safe_to_release_isolation
+
+    def recovery_context(self, container: ContainerRef | None = None) -> str:
+        resolved = container or self._container
+        container_id = "unknown" if resolved is None else resolved.container_id
+        rule_id = "unknown" if self._lease is None else self._lease.rule_id
+        return (
+            f"judge_container_id={container_id},"
+            f"network_id={self._network.network_id},"
+            f"policy_rule_id={rule_id}"
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if not self._safe_to_release_isolation:
+            raise InfrastructureError(
+                "recovery_required: refusing to remove Judge policy/network while "
+                f"containment is unproven; {self.recovery_context()}"
+            )
+        if self._lease is not None:
+            rule_id = self._lease.rule_id
+            try:
+                self._enforcer.cleanup(self._lease)
+            except Exception as error:
+                self._safe_to_release_isolation = False
+                raise InfrastructureError(
+                    "recovery_required: Judge policy cleanup is unproven: "
+                    f"{_error_text(error)}; {self.recovery_context()}"
+                ) from error
+            self._observer.judge_policy_removed(self._round_id, rule_id)
+            self._lease = None
+        try:
+            self._provisioner.remove_network(self._network)
+        except Exception as error:
+            self._safe_to_release_isolation = False
+            raise InfrastructureError(
+                "recovery_required: Judge network removal is unproven: "
+                f"{_error_text(error)}; {self.recovery_context()}"
+            ) from error
+        self._observer.judge_network_removed(self._round_id, self._network.network_id)
+        self._closed = True
+
+
+class DockerJudgeRuntimeFactory:
+    """Create a fresh Docker bridge and fail-closed policy owner per round."""
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        run_id: str,
+        task_id: str,
+        task_source_dir: Path,
+        allowed_mount_roots: Sequence[Path],
+        network_policy_enforcer: NetworkPolicyEnforcer,
+        lifecycle_observer: JudgeResourceMutationObserver,
+        work_container: ContainerRef | None = None,
+        omit_gpu_device_requests_for_tests: bool = False,
+        sandbox_lifecycle: Any | None = None,
+        model_access: JudgeModelAccess | None = None,
+    ) -> None:
+        if sandbox_lifecycle is None:
+            from rsi_harness.runtime.sandbox_lifecycle import NullSandboxLifecycle
+
+            sandbox_lifecycle = NullSandboxLifecycle()
+        self._sandbox_lifecycle = sandbox_lifecycle
+        self._model_access = model_access
+        self._client = client
+        self._run_id = run_id
+        self._task_id = task_id
+        self._task_source_dir = task_source_dir
+        self._allowed_mount_roots = tuple(allowed_mount_roots)
+        self._enforcer = network_policy_enforcer
+        self._observer = lifecycle_observer
+        if work_container is not None and work_container.role != "work":
+            raise SetupError("Judge volume authority requires a Work container")
+        self._work_container = work_container
+        self._omit_gpu_device_requests_for_tests = omit_gpu_device_requests_for_tests
+
+    def __call__(self, plan: RunPlan, round_id: str) -> DockerJudgeRoundRuntime:
+        model_access = require_model_access(plan, self._model_access)
+        api_endpoints = () if model_access is None else model_access.endpoints
+        sandbox_options = {}
+        if self._sandbox_lifecycle.enabled:
+            endpoint = self._sandbox_lifecycle.prepare_judge(round_id)
+            if endpoint is not None:
+                sandbox_options["sandbox_socket_dir"] = endpoint.directory
+        common = {
+            "run_id": self._run_id,
+            "task_id": self._task_id,
+            "role": "judge",
+            "task_source_dir": self._task_source_dir,
+            "allowed_mount_roots": self._allowed_mount_roots,
+            "omit_gpu_device_requests_for_tests": (
+                self._omit_gpu_device_requests_for_tests
+            ),
+        }
+        provisioner = DockerContainerRuntime(self._client, **common)
+        planned_network = provisioner.planned_network_name(round_id)
+        self._observer.judge_network_planned(round_id, planned_network)
+        try:
+            network = provisioner.create_network(
+                round_id,
+                internal=judge_requires_internal_bridge(
+                    "judge", plan.task.verifier.network.mode, bool(api_endpoints)
+                ),
+            )
+        except SetupError as primary:
+            # The Docker boundary only returns SetupError after exact
+            # planned-name/label absence has been proved. Clear the durable
+            # plan before allowing snapshot release and Work resume.
+            try:
+                self._observer.judge_network_removed(round_id, planned_network)
+            except BaseException as observer_error:
+                raise InfrastructureError(
+                    "recovery_required: Judge network is proven absent but "
+                    "durable planned authority could not be cleared: "
+                    f"{_error_text(observer_error)}; "
+                    f"planned_network={planned_network}"
+                ) from primary
+            raise
+        try:
+            self._observer.judge_network_created(round_id, network)
+            runtime = DockerContainerRuntime(
+                self._client,
+                **common,
+                network=network,
+                network_policy_enforcer=self._enforcer,
+                exec_output_limit_bytes=plan.task.verifier.output_limit_bytes,
+                workdir_volume_references=(
+                    () if self._work_container is None else (self._work_container,)
+                ),
+                judge_model_access=bool(api_endpoints),
+                **sandbox_options,
+            )
+            return DockerJudgeRoundRuntime(
+                runtime=runtime,
+                provisioner=provisioner,
+                enforcer=self._enforcer,
+                network=network,
+                policy=plan.task.verifier.network,
+                round_id=round_id,
+                planned_container_name=runtime.planned_container_name(round_id),
+                observer=self._observer,
+                api_endpoints=api_endpoints,
+            )
+        except BaseException as primary:
+            try:
+                provisioner.remove_network(network)
+            except BaseException as rollback_error:
+                raise InfrastructureError(
+                    "recovery_required: Judge network creation rollback is "
+                    f"unproven: {_error_text(rollback_error)}; "
+                    f"planned_network={planned_network}"
+                ) from primary
+            try:
+                self._observer.judge_network_removed(round_id, network.network_id)
+            except BaseException as observer_error:
+                raise InfrastructureError(
+                    "recovery_required: Judge network rollback is physically "
+                    "proven but durable removal authority is unproven: "
+                    f"{_error_text(observer_error)}; "
+                    f"planned_network={planned_network},"
+                    f"network_id={network.network_id}"
+                ) from primary
+            raise
+
+
+class JudgeRunner:
+    """Evaluate one immutable Work snapshot and recover Work on every path."""
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        workdir_volume: ManagedWorkdirVolume | None = None,
+        work_runtime: WorkRuntime,
+        judge_runtime_factory: Callable[[RunPlan, str], JudgeRoundRuntime],
+        snapshot_backend: RootfsSnapshotPort,
+        artifact_writer: ArtifactWriterPort,
+        quiescence_checker: Callable[[GPUAllocation, ContainerRef], None],
+        reward_reader: Callable[[Path, str | None], RewardResult] = read_reward,
+        monotonic: Callable[[], float] = time.monotonic,
+        lifecycle_observer: Any | None = None,
+        verifier_secret_env: Mapping[str, str] | None = None,
+        event_callback: Callable[[str, object], None] | None = None,
+        sandbox_lifecycle: Any | None = None,
+        model_access: JudgeModelAccess | None = None,
+        special_file_check: Callable[
+            [ManagedWorkdirVolume, str], Sequence[tuple[PurePosixPath, str]]
+        ]
+        | None = None,
+    ) -> None:
+        if sandbox_lifecycle is None:
+            from rsi_harness.runtime.sandbox_lifecycle import NullSandboxLifecycle
+
+            sandbox_lifecycle = NullSandboxLifecycle()
+        self._sandbox_lifecycle = sandbox_lifecycle
+        self._model_access = model_access
+        # A split-WORKDIR round: FIFOs, sockets and devices in the paused
+        # volume (DockerWorkdirVolumeBackend.special_files).
+        self._special_file_check = special_file_check
+        self._run_id = run_id
+        self._workdir_volume = workdir_volume
+        self._work_runtime = work_runtime
+        self._judge_runtime_factory = judge_runtime_factory
+        self._snapshot_backend = snapshot_backend
+        self._artifact_writer = artifact_writer
+        self._quiescence_checker = quiescence_checker
+        self.reward_reader = reward_reader
+        self._monotonic = monotonic
+        self._lifecycle_observer = lifecycle_observer
+        self._verifier_secret_env = dict(verifier_secret_env or {})
+        self._event_callback = event_callback or (lambda _name, _value: None)
+        self.recovery_required = False
+        self.submission_closed = False
+
+    def evaluate(self, request: EvaluationRequest) -> SubmissionReport:
+        started = self._monotonic()
+        plan = request.run_plan
+        status = SubmissionStatus.INFRASTRUCTURE_ERROR
+        rewards: dict[str, float] = {}
+        score: float | None = None
+        output = ""
+        exit_code: int | None = None
+        timed_out = False
+        verifier_output_required = False
+        full_output_captured = False
+        primary_error: str | None = None
+        cleanup_errors: list[str] = []
+        paused = False
+        safe_to_release_isolation = True
+        lease: RootfsSnapshotLease | None = None
+        planned_snapshot_ref: str | None = None
+        judge_round: JudgeRoundRuntime | None = None
+        judge: ContainerRef | None = None
+        engine_bug: StateTransitionError | None = None
+        verifier_error_secrets: set[str] = set()
+        persisted_report: SubmissionReport | None = None
+        artifact_error: BaseException | None = None
+        retry_candidate: SubmissionError | None = None
+        retry_reason: str | None = None
+        family_freeze_started = False
+        family_frozen = False
+        work_ended = False
+        sandbox_endpoint = None
+        trajectory: Path | None = None
+        judge_removed = False
+        model_access: JudgeModelAccess | None = None
+
+        try:
+            self._validate_feedback_output(request)
+            self._validate_workdir_volume(plan)
+            if tuple(plan.task.verifier.command) != VERIFIER_COMMAND:
+                raise RuntimeError(
+                    "RunPlan verifier command is not the fixed Harbor test command"
+                )
+            model_access = require_model_access(plan, self._model_access)
+            if model_access is not None and model_access.work_login is not None:
+                # Before Work pauses: Docker cannot read a paused container.
+                model_access = self._renew_work_login(request, model_access)
+            if model_access is not None and model_access.operator_login is not None:
+                model_access = self._renew_operator_login(
+                    request, model_access, plan.task.verifier.timeout_seconds
+                )
+            if model_access is not None:
+                # Judge output becomes Agent feedback and run logs: the
+                # credentials never appear in either.
+                verifier_error_secrets.update(model_access.secret_values)
+            if self._sandbox_lifecycle.enabled:
+                family_freeze_started = True
+                try:
+                    self._sandbox_lifecycle.freeze_work()
+                except RetryableSubmissionError as error:
+                    # Busy admission is rejected before any family mutation.
+                    family_freeze_started = False
+                    retry_candidate = error
+                    retry_reason = _error_text(error, verifier_error_secrets)
+                    primary_error = retry_reason
+                    raise _SubmissionRejected from error
+                except Exception as error:
+                    raise InfrastructureError(
+                        "recovery_required: sandbox Work family freeze failed: "
+                        f"{_error_text(error, verifier_error_secrets)}"
+                    ) from error
+                family_frozen = True
+            if (
+                request.final
+                and self._work_runtime.inspect_quiescence(request.work_container)
+                is WorkQuiescence.STOPPED
+            ):
+                # A final-judge run's Work, stopped when the Agent's time
+                # ended: already quiescent, and it stays stopped.
+                work_ended = True
+            else:
+                self._observe(
+                    "work_pause_planned",
+                    work_container_id=request.work_container.container_id,
+                )
+                paused = True
+                self._work_runtime.pause(request.work_container)
+                self._observe(
+                    "work_paused",
+                    work_container_id=request.work_container.container_id,
+                )
+            if plan.gpu_plan.judge_mode is JudgeGPUMode.RELEASE_ALL:
+                try:
+                    self._quiescence_checker(plan.gpu_plan.work, request.work_container)
+                except SubmissionError as error:
+                    retry_candidate = error
+                    retry_reason = (
+                        "release all Work GPU processes before retrying: "
+                        f"{_error_text(error, verifier_error_secrets)}"
+                    )
+                    primary_error = _error_text(error, verifier_error_secrets)
+                    raise _SubmissionRejected from error
+            if paused and self._workdir_volume is not None:
+                found = self._special_files(plan)
+                if found:
+                    retry_reason = special_files_refusal(found, plan.workdir)
+                    retry_candidate = SubmissionError(retry_reason)
+                    primary_error = retry_reason
+                    raise _SubmissionRejected
+            log_dir = self._prepare_log_dir(request)
+            # Freeze the Agent's output now, while Work is paused: the Judge
+            # sees exactly what led to this submission and nothing later.
+            trajectory = capture_round_trajectory(
+                self._run_root(plan), request.round_id, owner=_sudo_invoking_owner()
+            )
+            # A clean-image Judge does not start from this commit, but skipping
+            # it would change the snapshot lease and recovery protocol.
+            planned_snapshot_ref = self._snapshot_backend.planned_ref(
+                run_id=self._run_id,
+                task_id=plan.task.task_id,
+                round_id=request.round_id,
+                purpose="judge-round",
+            )
+            if _JUDGE_SNAPSHOT_REF.fullmatch(planned_snapshot_ref) is None:
+                raise InfrastructureError(
+                    "rootfs snapshot backend returned an invalid planned Judge "
+                    "image reference"
+                )
+            # A failed durable plan write cannot authorize the commit mutation.
+            # Keep Work paused because the runtime write itself is unproven.
+            safe_to_release_isolation = False
+            self._observe(
+                "snapshot_planned",
+                round_id=request.round_id,
+                planned_snapshot_ref=planned_snapshot_ref,
+                source_work_container_id=request.work_container.container_id,
+            )
+            safe_to_release_isolation = True
+            try:
+                lease = self._snapshot_backend.acquire(
+                    request.work_container,
+                    run_id=self._run_id,
+                    task_id=plan.task.task_id,
+                    round_id=request.round_id,
+                    purpose="judge-round",
+                    planned_ref=planned_snapshot_ref,
+                )
+            except RootfsSnapshotNotCreatedError:
+                # No commit mutation exists, but the durable planned authority
+                # must be cancelled before Work may resume.
+                safe_to_release_isolation = False
+                self._observe(
+                    "snapshot_cancelled",
+                    round_id=request.round_id,
+                    planned_snapshot_ref=planned_snapshot_ref,
+                    source_work_container_id=request.work_container.container_id,
+                )
+                safe_to_release_isolation = True
+                raise
+            # The external commit now exists. Do not release it or resume Work
+            # until its complete actual identity is durable and attested.
+            safe_to_release_isolation = False
+            self._attest_snapshot_lease(request, lease, planned_snapshot_ref)
+            self._observe(
+                "snapshot_acquired",
+                snapshot_lease_id=lease.lease_id,
+                snapshot_image_id=lease.image_id,
+                snapshot_image_ref=lease.image_ref,
+                snapshot_source_container_id=lease.source_container_id,
+            )
+            safe_to_release_isolation = True
+            self._observe("judge_planned", round_id=request.round_id)
+            if self._sandbox_lifecycle.enabled:
+                sandbox_endpoint = self._sandbox_lifecycle.prepare_judge(
+                    request.round_id
+                )
+                if sandbox_endpoint is not None:
+                    token = sandbox_endpoint.environment.get("RSI_SANDBOX_TOKEN")
+                    if token:
+                        verifier_error_secrets.add(token)
+            judge_agent = (
+                None
+                if model_access is None
+                else install_judge_agent(
+                    self._run_root(plan), owner=_sudo_invoking_owner()
+                )
+            )
+            # Every Judge: rsi-isolate, for code it must not trust.
+            judge_isolate = install_judge_isolate(
+                self._run_root(plan), owner=_sudo_invoking_owner()
+            )
+            judge_round = self._judge_runtime_factory(plan, request.round_id)
+            judge_spec, verifier_environment = self._judge_spec(
+                request,
+                lease,
+                log_dir,
+                verifier_error_secrets,
+                sandbox_endpoint=sandbox_endpoint,
+                trajectory=trajectory,
+                model_access=model_access,
+                judge_agent=judge_agent,
+                judge_isolate=judge_isolate,
+            )
+            judge = judge_round.create(judge_spec)
+            self._observe(
+                "judge_created",
+                judge_container_id=judge.container_id,
+                recovery_context=judge_round.recovery_context(judge),
+            )
+            judge_round.start(judge)
+            if model_access is not None:
+                owner = _auth_owner(judge_spec.user)
+                if model_access.auth is not None:
+                    judge_round.inject_agent_auth(judge, model_access.auth, owner=owner)
+                # rsi-agent alone reads the Agent's credentials and launch spec.
+                # The verifier's timeout starts just after this.
+                ends_at = (
+                    time.time()
+                    + plan.task.verifier.timeout_seconds
+                    + JUDGE_ROUND_END_SLACK_SECONDS
+                )
+                judge_round.inject_judge_agent(
+                    judge, model_access.round_launch(ends_at), owner=owner
+                )
+            if plan.task.verifier.visibility == "public":
+                # Work saw these tests read-only: run exactly the same bytes.
+                require_tests_digest(
+                    plan.task.source_dir / "tests", plan.task.tests_digest
+                )
+            judge_round.inject_tests(judge, plan.task.source_dir / "tests")
+            self._event_callback("judge_exec_started", {"round_id": request.round_id})
+            exec_options = {}
+            output_secrets: set[str] = set()
+            if model_access is not None:
+                output_secrets.update(model_access.secret_values)
+            if self._sandbox_lifecycle.enabled:
+                deadline = self._monotonic() + plan.task.verifier.timeout_seconds
+                self._sandbox_lifecycle.activate_judge(deadline)
+                exec_options["deadline"] = deadline
+                if sandbox_endpoint is not None:
+                    token = sandbox_endpoint.environment.get("RSI_SANDBOX_TOKEN")
+                    if token:
+                        output_secrets.add(token)
+            exec_output_secrets = tuple(sorted(output_secrets))
+            if exec_output_secrets:
+                exec_options["output_redact_values"] = exec_output_secrets
+            verifier_output_required = True
+            result = judge_round.exec(
+                judge,
+                VERIFIER_COMMAND,
+                timeout_seconds=plan.task.verifier.timeout_seconds,
+                environment=verifier_environment,
+                output_path=request.verifier_output,
+                **exec_options,
+            )
+            output = _bounded_output(
+                redact_exact_values(result.output, exec_output_secrets),
+                limit=plan.task.verifier.output_limit_bytes,
+                truncated=result.output_truncated,
+            )
+            if output:
+                self._event_callback(
+                    "judge_output",
+                    redact_text(redact_exact_values(output, verifier_error_secrets)),
+                )
+            exit_code = result.exit_code
+            timed_out = result.timed_out
+            full_output_captured = result.full_output_captured
+            if timed_out and not result.exec_started:
+                verifier_output_required = False
+            if timed_out:
+                self._discard_timeout_rewards(log_dir)
+                status = SubmissionStatus.VERIFIER_TIMEOUT
+                primary_error = "Judge verifier timed out; partial reward was discarded"
+            else:
+                reward = self.reward_reader(
+                    log_dir,
+                    plan.task.verifier.primary_reward,
+                )
+                if reward.error is not None:
+                    status = SubmissionStatus.VERIFIER_ERROR
+                    primary_error = _redact_error_text(
+                        reward.error, verifier_error_secrets
+                    )
+                else:
+                    status = SubmissionStatus.COMPLETED
+                    rewards = dict(reward.rewards)
+                    score = reward.score
+        except _SubmissionRejected:
+            pass
+        except StateTransitionError as error:
+            engine_bug = error
+        except Exception as error:
+            if (
+                isinstance(error, PrivateLogContentError)
+                and error.exec_result is not None
+            ):
+                output = _bounded_output(
+                    redact_exact_values(error.exec_result.output, exec_output_secrets),
+                    limit=plan.task.verifier.output_limit_bytes,
+                    truncated=error.exec_result.output_truncated,
+                )
+                exit_code = error.exec_result.exit_code
+                timed_out = error.exec_result.timed_out
+                full_output_captured = error.exec_result.full_output_captured
+            if isinstance(error, ContainerExecNotStartedError):
+                verifier_output_required = False
+                full_output_captured = False
+            primary_error = _error_text(error, verifier_error_secrets)
+            status = (
+                SubmissionStatus.VERIFIER_ERROR
+                if isinstance(error, PrivateLogContentError)
+                else SubmissionStatus.INFRASTRUCTURE_ERROR
+            )
+            score = None
+            if isinstance(error, RecoveryRequiredError) or (
+                not isinstance(error, PrivateLogContentError)
+                and "recovery_required" in primary_error
+            ):
+                safe_to_release_isolation = False
+        finally:
+            if family_freeze_started:
+                try:
+                    self._sandbox_lifecycle.close_judge()
+                except Exception as error:
+                    cleanup_errors.append(
+                        "sandbox Judge child cleanup: "
+                        f"{_error_text(error, verifier_error_secrets)}"
+                    )
+                    safe_to_release_isolation = False
+                if not family_frozen:
+                    cleanup_errors.extend(
+                        self._contain_work_family(verifier_error_secrets)
+                    )
+                    cleanup_errors.extend(
+                        self._restore_work_quiescence(
+                            request.work_container, verifier_error_secrets
+                        )
+                    )
+                    paused = True
+                    safe_to_release_isolation = False
+                if not self._sandbox_lifecycle.can_resume:
+                    if self._sandbox_lifecycle.work_ended_normally:
+                        # Work reached its deadline or was retired while this
+                        # accepted round ran: keep the result and leave Work
+                        # paused for the coordinator to remove.
+                        work_ended = True
+                        cleanup_errors.extend(
+                            self._close_after_work_end(verifier_error_secrets)
+                        )
+                    else:
+                        cleanup_errors.append(
+                            "recovery_required: sandbox Work phase expired, "
+                            "cancelled, or requires recovery; Work family "
+                            "remains contained"
+                        )
+                        safe_to_release_isolation = False
+                    self.submission_closed = True
+            # The evaluator is the sole report owner. Prove the required
+            # artifact write while Work is still paused and all round
+            # isolation is retained. SubmissionService only publishes the
+            # already-persisted result to its in-memory history.
+            if engine_bug is None and retry_candidate is None:
+                candidate = self._report(
+                    request,
+                    status=status,
+                    rewards=rewards,
+                    score=score,
+                    output=output,
+                    exit_code=exit_code,
+                    timed_out=timed_out,
+                    verifier_output_required=verifier_output_required,
+                    full_output_captured=full_output_captured,
+                    started=started,
+                    error=primary_error,
+                )
+                try:
+                    self._artifact_writer.record_submission(candidate)
+                    # A non-root controller's Work reads feedback from a
+                    # carried copy: publish it before Work runs again.
+                    refresh = getattr(self._work_runtime, "refresh_work_feedback", None)
+                    if refresh is not None:
+                        refresh(request.work_container)
+                except BaseException as error:
+                    artifact_error = error
+                    self.submission_closed = True
+                    if paused or family_frozen:
+                        self.recovery_required = True
+                        safe_to_release_isolation = False
+                        if family_frozen and not paused:
+                            cleanup_errors.extend(
+                                self._contain_work_family(verifier_error_secrets)
+                            )
+                            cleanup_errors.extend(
+                                self._restore_work_quiescence(
+                                    request.work_container, verifier_error_secrets
+                                )
+                            )
+                            paused = True
+                    try:
+                        self._observe(
+                            "recovery_required" if paused else "submission_closed",
+                            recovery_context=(
+                                "required submission artifact persistence failed"
+                            ),
+                        )
+                    except BaseException as marker_error:
+                        cleanup_errors.append(
+                            "recovery marker persistence: "
+                            f"{_error_text(marker_error, verifier_error_secrets)}"
+                        )
+                else:
+                    persisted_report = candidate
+            if judge is not None and judge_round is not None:
+                if artifact_error is not None:
+                    # The exact Judge is the only recoverable authority for a
+                    # round whose required report was not made durable. Stop
+                    # and attest it, but do not destroy it or any dependency.
+                    safe_to_release_isolation = False
+                    try:
+                        judge_round.contain_after_remove_failure(judge)
+                    except Exception as containment_error:
+                        cleanup_errors.append(
+                            "report-failure containment unproven: "
+                            f"{_error_text(containment_error, verifier_error_secrets)}"
+                        )
+                    else:
+                        cleanup_errors.append(
+                            "report-failure containment proved exact Judge "
+                            "stopped or gone"
+                        )
+                else:
+                    try:
+                        judge_round.remove(judge)
+                        judge_removed = True
+                        self._observe(
+                            "judge_removed", judge_container_id=judge.container_id
+                        )
+                    except Exception as error:
+                        cleanup_errors.append(
+                            "Judge removal: "
+                            f"{_error_text(error, verifier_error_secrets)}"
+                        )
+                        # A stopped-but-retained Judge is still an unremoved exact-
+                        # labeled resource. Do not resume Work or allocate a round
+                        # that could overwrite its single durable lease authority.
+                        safe_to_release_isolation = False
+                        try:
+                            judge_round.contain_after_remove_failure(judge)
+                        except Exception as containment_error:
+                            containment_detail = _error_text(
+                                containment_error, verifier_error_secrets
+                            )
+                            cleanup_errors.append(
+                                f"emergency containment unproven: {containment_detail}"
+                            )
+                            safe_to_release_isolation = False
+                        else:
+                            cleanup_errors.append(
+                                "emergency containment proved Judge stopped or gone"
+                            )
+            if trajectory is not None and (judge is None or judge_removed):
+                # The copied bytes are a range of the run's own output; only
+                # the manifest is kept once no Judge can read them.
+                release_round_trajectory(trajectory)
+            if judge_round is not None and not judge_round.safe_to_release_isolation:
+                safe_to_release_isolation = False
+            if judge_round is not None and safe_to_release_isolation:
+                try:
+                    judge_round.close()
+                except Exception as error:
+                    cleanup_errors.append(
+                        "Judge network/policy cleanup: "
+                        f"{_error_text(error, verifier_error_secrets)}"
+                    )
+                    safe_to_release_isolation = False
+            if not safe_to_release_isolation:
+                self.recovery_required = True
+                context = (
+                    "unknown"
+                    if judge_round is None
+                    else judge_round.recovery_context(judge)
+                )
+                snapshot_context = self._snapshot_recovery_context(
+                    lease=lease,
+                    planned_ref=planned_snapshot_ref,
+                    work=request.work_container,
+                )
+                cleanup_errors.append(
+                    "recovery_required: retained Judge policy/network, snapshot, "
+                    f"and Work pause; {context},{snapshot_context}"
+                )
+                self._observe(
+                    "recovery_required",
+                    recovery_context=f"{context},{snapshot_context}",
+                )
+            if lease is not None and safe_to_release_isolation:
+                try:
+                    self._snapshot_backend.release(lease)
+                    self._observe("snapshot_released", snapshot_lease_id=lease.lease_id)
+                except Exception as error:
+                    cleanup_errors.append(
+                        "snapshot release: "
+                        f"{_error_text(error, verifier_error_secrets)}"
+                    )
+                    safe_to_release_isolation = False
+                    cleanup_errors.append(
+                        "recovery_required: snapshot release is unproven; "
+                        f"snapshot_lease_id={lease.lease_id},"
+                        f"work_container_id={request.work_container.container_id}"
+                    )
+                    self.recovery_required = True
+                    self._observe(
+                        "recovery_required",
+                        recovery_context=f"snapshot_lease_id={lease.lease_id}",
+                    )
+            if (
+                family_frozen
+                and safe_to_release_isolation
+                and not work_ended
+                and not self._sandbox_lifecycle.can_resume
+                and self._sandbox_lifecycle.work_ended_normally
+            ):
+                # Work's deadline passed during Judge cleanup. Resume would
+                # now be denied, so keep the result exactly as above.
+                work_ended = True
+                cleanup_errors.extend(
+                    self._close_after_work_end(verifier_error_secrets)
+                )
+            if (
+                (paused or family_frozen)
+                and safe_to_release_isolation
+                and not work_ended
+            ):
+                try:
+                    if family_frozen:
+                        self._sandbox_lifecycle.resume_work()
+                        if not self._sandbox_lifecycle.can_resume:
+                            raise InfrastructureError(
+                                "sandbox Work phase ended during family resume"
+                            )
+                    if paused:
+                        self._sandbox_lifecycle.resume_parent(
+                            self._work_runtime, request.work_container
+                        )
+                        self._observe(
+                            "work_unpaused",
+                            work_container_id=request.work_container.container_id,
+                        )
+                    if family_frozen:
+                        self._sandbox_lifecycle.reopen_work()
+                except Exception as error:
+                    cleanup_errors.append(
+                        f"Work unpause: {_error_text(error, verifier_error_secrets)}"
+                    )
+                    if family_frozen:
+                        cleanup_errors.extend(
+                            self._contain_work_family(verifier_error_secrets)
+                        )
+                    cleanup_errors.extend(
+                        self._restore_work_quiescence(
+                            request.work_container,
+                            verifier_error_secrets,
+                        )
+                    )
+                    cleanup_errors.append(
+                        "recovery_required: Work unpause is unproven; "
+                        f"work_container_id={request.work_container.container_id}"
+                    )
+                    self.recovery_required = True
+                    try:
+                        self._observe(
+                            "recovery_required",
+                            recovery_context=(
+                                f"work_container_id={request.work_container.container_id}"
+                            ),
+                        )
+                    except Exception as observer_error:
+                        cleanup_errors.append(
+                            "recovery authority persistence: "
+                            f"{_error_text(observer_error, verifier_error_secrets)}"
+                        )
+
+        if engine_bug is not None:
+            raise engine_bug
+        if retry_candidate is not None and not cleanup_errors:
+            verifier_error_secrets.clear()
+            raise RetryableSubmissionError(
+                retry_reason or "submission rejected; retry after Work is ready"
+            ) from retry_candidate
+        if artifact_error is not None:
+            safe_error = _error_text(artifact_error, verifier_error_secrets)
+            verifier_error_secrets.clear()
+            raise InfrastructureError(
+                "required report artifact persistence failed: "
+                f"{safe_error or type(artifact_error).__name__}"
+            ) from artifact_error
+        if cleanup_errors:
+            status = SubmissionStatus.INFRASTRUCTURE_ERROR
+            score = None
+        error = _combined_error(primary_error, cleanup_errors)
+        report = self._report(
+            request,
+            status=status,
+            rewards=rewards,
+            score=score,
+            output=output,
+            exit_code=exit_code,
+            timed_out=timed_out,
+            verifier_output_required=verifier_output_required,
+            full_output_captured=full_output_captured,
+            started=started,
+            error=error,
+        )
+        if cleanup_errors:
+            try:
+                self._artifact_writer.record_submission(report)
+            except BaseException as persistence_error:
+                self.recovery_required = True
+                safe_error = _error_text(persistence_error, verifier_error_secrets)
+                verifier_error_secrets.clear()
+                raise InfrastructureError(
+                    "required cleanup report artifact persistence failed: "
+                    f"{safe_error or type(persistence_error).__name__}"
+                ) from persistence_error
+        elif persisted_report is not None:
+            report = persisted_report
+        if retry_candidate is not None:
+            verifier_error_secrets.clear()
+            raise InfrastructureError(
+                report.error or "recovery_required: Work unpause is unproven"
+            )
+        verifier_error_secrets.clear()
+        return report
+
+    def _special_files(self, plan: RunPlan) -> Sequence[tuple[PurePosixPath, str]]:
+        """FIFOs, sockets and devices in the paused WORKDIR volume, which the
+        Judge mounts read-only in place (special_files.py says why they are
+        refused). Every round with Work paused, final ones too: Work is
+        unpaused afterwards and a resumed attempt keeps the WORKDIR. Work
+        that has already stopped holds no end of any of them."""
+        if self._special_file_check is None or self._workdir_volume is None:
+            raise InfrastructureError("WORKDIR special-file check is unavailable")
+        try:
+            image = clean_judge_image(plan.images)
+        except SetupError as error:
+            raise InfrastructureError(str(error)) from None
+        return self._special_file_check(self._workdir_volume, image)
+
+    def _close_after_work_end(self, secret_values: set[str]) -> list[str]:
+        """Close the stream: a later round would re-pause the ended Work."""
+        self.submission_closed = True
+        try:
+            self._observe("submission_closed")
+        except Exception as error:
+            return [
+                "submission closure after Work end: "
+                f"{_error_text(error, secret_values)}"
+            ]
+        return []
+
+    def _contain_work_family(self, secret_values: set[str]) -> list[str]:
+        try:
+            self._sandbox_lifecycle.contain_work()
+        except Exception as error:
+            return [
+                "sandbox Work containment unproven: "
+                f"{_error_text(error, secret_values)}"
+            ]
+        return []
+
+    def _restore_work_quiescence(
+        self,
+        work: ContainerRef,
+        secret_values: set[str],
+    ) -> list[str]:
+        errors: list[str] = []
+        observed: WorkQuiescence | None = None
+        inspection_proven = False
+        try:
+            observed = self._work_runtime.inspect_quiescence(work)
+            inspection_proven = True
+        except Exception as error:
+            errors.append(
+                f"Work recovery inspection: {_error_text(error, secret_values)}"
+            )
+        if not inspection_proven or observed is None:
+            try:
+                self._work_runtime.pause(work)
+            except Exception as error:
+                errors.append(
+                    f"Work recovery pause: {_error_text(error, secret_values)}"
+                )
+            try:
+                observed = self._work_runtime.inspect_quiescence(work)
+                inspection_proven = True
+            except Exception as error:
+                inspection_proven = False
+                errors.append(
+                    f"Work recovery attestation: {_error_text(error, secret_values)}"
+                )
+        event = (
+            "work_recovery_state" if inspection_proven else "work_quiescence_unproven"
+        )
+        values = {
+            "work_container_id": work.container_id,
+            "paused": observed is WorkQuiescence.PAUSED,
+            "stopped": observed is WorkQuiescence.STOPPED,
+        }
+        try:
+            self._observe(event, **values)
+        except Exception as error:
+            errors.append(
+                "Work recovery authority persistence: "
+                f"{_error_text(error, secret_values)}"
+            )
+        if not inspection_proven or observed is None:
+            errors.append(
+                "recovery_required: exact Work quiescence remains unproven; "
+                f"work_container_id={work.container_id}"
+            )
+        return errors
+
+    @property
+    def model_access(self) -> JudgeModelAccess | None:
+        """The model access the next round starts from (its login renewed)."""
+        return self._model_access
+
+    def _renew_work_login(
+        self, request: EvaluationRequest, access: JudgeModelAccess
+    ) -> JudgeModelAccess:
+        """This round's Judge gets the login Work's Agent keeps refreshing.
+
+        The Work Agent can write those files, so a missing, malformed or
+        foreign login is never used: the round keeps the last good copy
+        (it never refreshes, so it only stops working once it expires) and
+        a ``judge_login_kept`` event says why. A broken login is no reason to
+        withhold the Work Agent's submission from its Judge, whatever it
+        breaks: any failure keeps the last good copy.
+        """
+        assert access.work_login is not None
+        try:
+            files = self._work_runtime.read_agent_auth(
+                request.work_container, access.work_login
+            )
+            renewed = access.with_work_login(current_login(access.work_login, files))
+        except Exception as error:  # Agent-written data: never fatal
+            self._event_callback(
+                "judge_login_kept",
+                {
+                    "round_id": request.round_id,
+                    "reason": _redact_error_text(
+                        login_kept_reason(error), set(access.secret_values)
+                    ),
+                },
+            )
+            return access
+        self._model_access = renewed
+        return renewed
+
+    def _renew_operator_login(
+        self, request: EvaluationRequest, access: JudgeModelAccess, round_seconds
+    ) -> JudgeModelAccess:
+        """This round's Judge LLM gets the operator's current Codex login.
+
+        Refreshed on the host first, by the pinned Codex CLI, when its access
+        token would not outlive the round. Whatever fails, the round keeps
+        the Judge's current copy and a ``judge_login_refresh_failed`` event
+        says why: calls the copy would not outlive are refused (exit 3).
+        """
+        assert access.operator_login is not None
+        try:
+            renewal = renew_operator_login(
+                access.operator_login,
+                codex_cli=access.codex_cli,
+                round_seconds=float(round_seconds),
+            )
+            renewed = access
+            if (
+                renewal.content is not None
+                and judge_codex_login(renewal.content)
+                != json.loads(access.launch)["llm"]["auth_json"]
+            ):
+                renewed = access.with_operator_login(renewal.content)
+            warning = renewal.warning
+        except Exception as error:  # never fatal: the copy works until it expires
+            renewed = access
+            warning = f"the login could not be used ({type(error).__name__})"
+        if warning is not None:
+            self._event_callback(
+                "judge_login_refresh_failed",
+                {
+                    "round_id": request.round_id,
+                    "reason": _redact_error_text(warning, set(renewed.secret_values)),
+                },
+            )
+        self._model_access = renewed
+        return renewed
+
+    def _observe(self, name: str, **values: object) -> None:
+        if self._lifecycle_observer is not None:
+            self._lifecycle_observer.resource_event(name, **values)
+
+    def _report(
+        self,
+        request: EvaluationRequest,
+        *,
+        status: SubmissionStatus,
+        rewards: dict[str, float],
+        score: float | None,
+        output: str,
+        exit_code: int | None,
+        timed_out: bool,
+        verifier_output_required: bool,
+        full_output_captured: bool,
+        started: float,
+        error: str | None,
+    ) -> SubmissionReport:
+        return SubmissionReport(
+            round_id=request.round_id,
+            status=status,
+            rewards=rewards,
+            score=score,
+            output=output,
+            exit_code=exit_code,
+            timed_out=timed_out,
+            verifier_output_required=verifier_output_required,
+            full_output_captured=full_output_captured,
+            duration_seconds=max(0.0, self._monotonic() - started),
+            error=error,
+        )
+
+    @staticmethod
+    def _prepare_log_dir(request: EvaluationRequest) -> Path:
+        root = request.run_plan.paths.logs.resolve()
+        candidate = request.verifier_logs.resolve(strict=False)
+        if candidate == root or root not in candidate.parents:
+            raise RuntimeError("verifier log directory is outside RunPlan logs")
+        if candidate.exists():
+            raise RuntimeError("verifier log directory already exists")
+        candidate.mkdir(parents=True, mode=0o700)
+        return candidate
+
+    def _judge_spec(
+        self,
+        request: EvaluationRequest,
+        lease: RootfsSnapshotLease,
+        log_dir: Path,
+        error_secret_values: set[str],
+        *,
+        sandbox_endpoint: Any | None = None,
+        trajectory: Path | None = None,
+        model_access: JudgeModelAccess | None = None,
+        judge_agent: Path | None = None,
+        judge_isolate: Path | None = None,
+    ) -> tuple[ContainerSpec, dict[str, str]]:
+        plan = request.run_plan
+        try:
+            environment = resolve_runtime_environment(
+                tuple(
+                    (key, value)
+                    for key, value in plan.task.verifier.environment
+                    if key
+                    not in {
+                        NVIDIA_VISIBLE_DEVICES_ENV,
+                        VERIFIER_EXPECTED_GPU_UUIDS_ENV,
+                    }
+                ),
+                self._verifier_secret_env,
+            )
+        except MissingRuntimeEnvironmentError as error:
+            raise InfrastructureError(
+                f"missing verifier runtime environment variable '{error.name}'"
+            ) from error
+        environment[VERIFIER_EXPECTED_GPU_UUIDS_ENV] = ",".join(
+            plan.gpu_plan.judge.uuids
+        )
+        environment[NVIDIA_VISIBLE_DEVICES_ENV] = nvidia_visible_devices_value(
+            plan.gpu_plan.judge
+        )
+        secret_names = set(plan.task.verifier.secret_env_names)
+        error_secret_values.update(
+            environment[key]
+            for key, template in plan.task.verifier.environment
+            if key in environment
+            and runtime_template_name(template) in secret_names
+            and environment[key]
+        )
+        model_tmpfs: tuple[ContainerTmpfs, ...] = ()
+        agent_mounts: tuple[ContainerMount, ...] = ()
+        if model_access is not None:
+            # Only the Agent's name, model and effort: the procedure calls the
+            # model through rsi-agent, which alone holds the credentials.
+            environment.update(model_access.environment)
+            error_secret_values.update(model_access.secret_values)
+            if model_access.auth is not None:
+                model_tmpfs = tuple(mount.tmpfs for mount in model_access.auth.mounts)
+            model_tmpfs += JUDGE_AGENT_TMPFS
+            if judge_agent is None:
+                raise InfrastructureError("rsi-agent is not installed for this run")
+            agent_mounts = (
+                ContainerMount(
+                    source=judge_agent, target=JUDGE_AGENT_CODE_TARGET, read_only=True
+                ),
+                ContainerMount(
+                    source=judge_agent / JUDGE_AGENT_LAUNCHER,
+                    target=JUDGE_AGENT_LAUNCHER_TARGET,
+                    read_only=True,
+                ),
+            )
+            if model_access.codex_cli is not None:
+                # The Judge LLM's Codex CLI: the Harness's pinned copy,
+                # read-only, never part of the Work image.
+                agent_mounts += (
+                    ContainerMount(
+                        source=model_access.codex_cli,
+                        target=JUDGE_CODEX_TARGET,
+                        read_only=True,
+                    ),
+                )
+        isolate_mounts: tuple[ContainerMount, ...] = ()
+        if judge_isolate is not None:
+            isolate_mounts = (
+                ContainerMount(
+                    source=judge_isolate,
+                    target=JUDGE_ISOLATE_CODE_TARGET,
+                    read_only=True,
+                ),
+                ContainerMount(
+                    source=judge_isolate / JUDGE_ISOLATE_LAUNCHER,
+                    target=JUDGE_ISOLATE_LAUNCHER_TARGET,
+                    read_only=True,
+                ),
+            )
+        sandbox_mounts = ()
+        if sandbox_endpoint is not None:
+            environment.update(sandbox_endpoint.environment)
+            token = sandbox_endpoint.environment.get("RSI_SANDBOX_TOKEN")
+            if token:
+                error_secret_values.add(token)
+            sandbox_mounts = (sandbox_endpoint.mount,)
+        # Docker has no operator fallback. Set it explicitly: an ENV in the
+        # task's image must not choose how a science Judge library isolates.
+        environment[JUDGE_ISOLATION_FALLBACK_ENV] = "none"
+        environment[JUDGE_ALLOW_MISSING_LANDLOCK_SIGNAL_ENV] = "0"
+        # Every Docker container has a network namespace of its own.
+        environment[JUDGE_NETNS_ENV] = "private"
+        trajectory_mounts = ()
+        if trajectory is not None:
+            trajectory_mounts = (
+                ContainerMount(
+                    source=trajectory,
+                    target=JUDGE_TRAJECTORY_ROOT,
+                    read_only=True,
+                ),
+            )
+        public = plan.task.verifier.visibility == "public"
+        judge_user = (
+            plan.images.judge_user or plan.task.verifier.user or plan.task.service.user
+        )
+        # A root Judge runs rsi-agent's Agent as its own user: hidden tests
+        # stay out of its reach.
+        tests_mode = (
+            "0700"
+            if model_access is not None
+            and not public
+            and _auth_owner(judge_user) is None
+            else "0755"
+        )
+        image = lease.image_id
+        if judge_uses_clean_image(plan):
+            try:
+                image = clean_judge_image(plan.images)
+            except SetupError as error:
+                raise InfrastructureError(str(error)) from None
+        return (
+            ContainerSpec(
+                image=image,
+                # Public only: Work read this procedure. A hidden clean Judge
+                # gets a writable container layer, discarded with it.
+                read_only_rootfs=public,
+                command=("/bin/sleep", "infinity"),
+                workdir=plan.workdir,
+                user=judge_user,
+                environment=(),
+                # Model access only: name the pinned endpoint addresses as
+                # Work does, and with "no-network" keep external DNS out of
+                # reach of the routable bridge.
+                extra_hosts=(() if model_access is None else model_access.extra_hosts),
+                dns=no_network_dns_servers(
+                    plan.task.verifier.network.mode, model_access is not None
+                ),
+                shm_size=plan.task.service.shm_size,
+                cpus=plan.task.service.cpus,
+                memory_mb=plan.task.service.memory_mb,
+                storage_mb=plan.task.service.storage_mb,
+                tmpfs=(
+                    ContainerTmpfs(
+                        target=PurePosixPath("/tests"),
+                        options=f"rw,exec,nosuid,nodev,mode={tests_mode}",
+                    ),
+                )
+                + ((PUBLIC_JUDGE_TMP,) if public else ())
+                + model_tmpfs,
+                mounts=(
+                    ContainerMount(
+                        source=log_dir,
+                        target=PurePosixPath("/logs/verifier"),
+                    ),
+                )
+                + trajectory_mounts
+                + agent_mounts
+                + isolate_mounts
+                + sandbox_mounts,
+                volume_mounts=(
+                    (
+                        ContainerVolumeMount(
+                            volume=self._workdir_volume,
+                            target=plan.workdir,
+                            read_only=True,
+                        ),
+                    )
+                    if self._workdir_volume is not None
+                    else ()
+                ),
+                gpu_allocation=plan.gpu_plan.judge,
+                labels=(("rsi-harness.round-id", request.round_id),),
+            ),
+            environment,
+        )
+
+    def _validate_workdir_volume(self, plan: RunPlan) -> None:
+        if plan.rootfs_snapshot_mode is RootfsSnapshotMode.SPLIT_WORKDIR:
+            validate_split_workdir_target(plan.workdir)
+            if self._workdir_volume is None:
+                raise InfrastructureError(
+                    "split WORKDIR Judge authority is unavailable"
+                )
+            if (
+                self._workdir_volume.driver != "local"
+                or self._workdir_volume.run_id != self._run_id
+                or self._workdir_volume.task_id != plan.task.task_id
+                or self._workdir_volume.target != plan.workdir
+            ):
+                raise InfrastructureError(
+                    "split WORKDIR Judge authority is inconsistent"
+                )
+        elif self._workdir_volume is not None:
+            raise InfrastructureError("full-rootfs Judge received volume authority")
+
+    def _run_root(self, plan: RunPlan) -> Path:
+        return plan.paths.logs / "runs" / self._run_id / plan.task.task_id
+
+    def _validate_feedback_output(self, request: EvaluationRequest) -> None:
+        if re.fullmatch(r"agent-[1-9][0-9]*", request.round_id) is None:
+            raise InfrastructureError("Judge round identity is invalid")
+        feedback_root = (
+            request.run_plan.paths.logs
+            / "runs"
+            / self._run_id
+            / request.run_plan.task.task_id
+            / "feedback"
+        )
+        expected = feedback_root / f"{request.round_id}.log"
+        if request.verifier_output != expected:
+            raise InfrastructureError(
+                "Judge feedback output path differs from exact run authority"
+            )
+        self._attest_directory_without_symlinks(
+            request.run_plan.paths.logs, feedback_root
+        )
+
+    @staticmethod
+    def _attest_directory_without_symlinks(root: Path, directory: Path) -> None:
+        try:
+            relative = directory.relative_to(root)
+        except ValueError as error:
+            raise InfrastructureError(
+                "Judge feedback directory is outside exact logs authority"
+            ) from error
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptors: list[int] = []
+        try:
+            descriptor = os.open(root, flags)
+            descriptors.append(descriptor)
+            for component in relative.parts:
+                if component in {"", ".", ".."}:
+                    raise InfrastructureError(
+                        "Judge feedback directory contains unsafe components"
+                    )
+                descriptor = os.open(component, flags, dir_fd=descriptor)
+                descriptors.append(descriptor)
+        except OSError as error:
+            raise InfrastructureError(
+                "Judge feedback directory is missing, non-directory, or symlinked"
+            ) from error
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def _attest_snapshot_lease(
+        self,
+        request: EvaluationRequest,
+        lease: RootfsSnapshotLease,
+        planned_ref: str,
+    ) -> None:
+        plan = request.run_plan
+        if (
+            lease.purpose != "judge-round"
+            or lease.run_id != self._run_id
+            or lease.task_id != plan.task.task_id
+            or lease.round_id != request.round_id
+            or lease.source_container_id != request.work_container.container_id
+            or lease.image_ref != planned_ref
+            or _JUDGE_SNAPSHOT_REF.fullmatch(lease.image_ref) is None
+            or _ROOTFS_IMAGE_ID.fullmatch(lease.image_id) is None
+        ):
+            raise InfrastructureError(
+                "recovery_required: acquired Judge rootfs snapshot authority "
+                "does not match the planned paused Work state"
+            )
+
+    @staticmethod
+    def _snapshot_recovery_context(
+        *,
+        lease: RootfsSnapshotLease | None,
+        planned_ref: str | None,
+        work: ContainerRef,
+    ) -> str:
+        if lease is None:
+            return (
+                "snapshot_lease_id=unknown,"
+                f"snapshot_image_ref={planned_ref or 'unknown'},"
+                f"work_container_id={work.container_id}"
+            )
+        return (
+            f"snapshot_lease_id={lease.lease_id},"
+            f"snapshot_image_id={lease.image_id},"
+            f"snapshot_image_ref={lease.image_ref},"
+            f"work_container_id={lease.source_container_id}"
+        )
+
+    @staticmethod
+    def _discard_timeout_rewards(log_dir: Path) -> None:
+        for name in ("reward.json", "reward.txt"):
+            (log_dir / name).unlink(missing_ok=True)
+
+
+def _bounded_output(output: str, *, limit: int, truncated: bool) -> str:
+    encoded = output.encode()
+    if not truncated and len(encoded) <= limit:
+        return output
+    marker = OUTPUT_TRUNCATION_MARKER.encode()
+    if limit <= len(marker):
+        return marker[:limit].decode(errors="ignore")
+    budget = limit - len(marker)
+    head_limit = (budget + 1) // 2
+    tail_limit = budget - head_limit
+    head = encoded[:head_limit].decode(errors="ignore")
+    tail = encoded[-tail_limit:].decode(errors="ignore") if tail_limit else ""
+    value = head + OUTPUT_TRUNCATION_MARKER + tail
+    while len(value.encode()) > limit and tail:
+        tail = tail[1:]
+        value = head + OUTPUT_TRUNCATION_MARKER + tail
+    return value
+
+
+def _redact_error_text(detail: str, secret_values: set[str]) -> str:
+    return redact_exact_values(detail, secret_values)
+
+
+def _error_text(error: BaseException, secret_values: set[str] | None = None) -> str:
+    detail = str(error).strip()
+    value = detail or type(error).__name__
+    return _redact_error_text(value, secret_values or set())
+
+
+def _combined_error(primary: str | None, cleanup: list[str]) -> str | None:
+    if not cleanup:
+        return primary
+    cleanup_text = "; ".join(cleanup)
+    if primary is None:
+        return f"cleanup failure: {cleanup_text}"
+    return f"primary failure: {primary}; cleanup failure: {cleanup_text}"
+
+
+__all__ = [
+    "DockerJudgeRuntimeFactory",
+    "JudgeRunner",
+    "JudgeResourceMutationObserver",
+    "OUTPUT_TRUNCATION_MARKER",
+    "VERIFIER_COMMAND",
+    "VERIFIER_EXPECTED_GPU_UUIDS_ENV",
+    "clean_judge_image",
+    "clean_judge_unavailable",
+    "judge_uses_clean_image",
+]

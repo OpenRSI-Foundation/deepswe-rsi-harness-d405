@@ -1,0 +1,89 @@
+schema_version = "1.4"
+
+[task]
+name = "rsi/deepswe-rsi-harness"
+version = "1.0.0"
+description = "Develop a complete coding harness from scratch on the fixed DeepSWE development roster."
+
+[metadata]
+author_name = "Tianyu Wang"
+author_email = "wty26@mails.tsinghua.edu.cn"
+difficulty_explanation = "Long coding episodes require coordinated harness, inference, and tool research with a small number of complete adaptive loops."
+verification_explanation = "Collect committed binary patches and grade them in pristine offline task containers using the pinned upstream verifiers."
+category = "ML"
+subcategory = "Evaluation"
+tags = ["autoresearch", "coding-agents", "deepswe"]
+expert_time_estimate_hours = 48
+
+[metadata.rsi_harness.verifier]
+gpus = 0
+
+[environment]
+os = "linux"
+workdir = "/workspace"
+cpus = 4
+memory_mb = 16384
+storage_mb = 262144
+build_timeout_sec = 7200
+gpus = 0
+network_mode = "no-network"
+
+[agent]
+timeout_sec = 172800
+network_mode = "no-network"
+
+[verifier]
+timeout_sec = 72000
+environment_mode = "shared"
+network_mode = "allowlist"
+allowed_hosts = ["api.openai.com", "api.anthropic.com"]
+
+[verifier.env]
+OPENAI_API_KEY = "${OPENAI_API_KEY}"
+ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}"
+DEEPSWE_IMAGE_LOCK = "${DEEPSWE_IMAGE_LOCK}"
+
+[metadata.rsi_harness.sandbox]
+version = 2
+
+[metadata.rsi_harness.sandbox.environments.work]
+network = ["none"]
+pull = true
+
+[metadata.rsi_harness.sandbox.environments.work.limits]
+max_envs_live = 2
+max_envs_created = 256
+max_services_per_env = 1
+max_containers_live = 2
+max_cpus_live = 4
+max_memory_mb_live = 16384
+max_disk_mb_live = 40960
+cpus_per_container = 2
+memory_mb_per_container = 8192
+disk_mb_per_container = 20480
+max_env_lifetime_sec = 14400
+max_operations = 20000000
+max_upload_bytes = 549755813888
+max_download_bytes = 549755813888
+max_log_bytes = 17179869184
+
+[metadata.rsi_harness.sandbox.environments.judge]
+network = ["none"]
+pull = true
+
+[metadata.rsi_harness.sandbox.environments.judge.limits]
+max_envs_live = 8
+max_envs_created = 512
+max_services_per_env = 1
+max_containers_live = 8
+max_cpus_live = 16
+max_memory_mb_live = 65536
+max_disk_mb_live = 163840
+cpus_per_container = 2
+memory_mb_per_container = 8192
+disk_mb_per_container = 20480
+max_env_lifetime_sec = 14400
+max_operations = 40000000
+max_upload_bytes = 549755813888
+max_download_bytes = 549755813888
+max_log_bytes = 17179869184

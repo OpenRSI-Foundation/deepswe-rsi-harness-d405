@@ -1,0 +1,2286 @@
+"""End-to-end ownership of one persistent Agent and explicit Judge rounds."""
+
+from __future__ import annotations
+
+import os
+import signal
+import threading
+import time
+import uuid
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal, Protocol
+
+from rsi_harness.errors import (
+    InfrastructureError,
+    RetryableSubmissionError,
+    SetupError,
+    StateTransitionError,
+)
+from rsi_harness.models import (
+    AgentRunResult,
+    ContainerRef,
+    EvaluationRequest,
+    FrozenRewardMap,
+    ManagedNetwork,
+    ManagedWorkdirVolume,
+    RootfsSnapshotLease,
+    RootfsSnapshotMode,
+    RunGPUPlan,
+    RunRequest,
+    RunResult,
+    RunStatus,
+    SubmissionReport,
+    SubmissionStatus,
+    TaskDefinition,
+    WorkQuiescence,
+    describe_provider_stop,
+    scored_reports,
+)
+from rsi_harness.runtime.mount_topology import validate_run_plan_mount_topology
+from rsi_harness.runtime.recovery import (
+    LeaseStore,
+    PriorRetainedImage,
+    ResourceLease,
+    RetainedImageRollbackAuthority,
+    RunAttemptLease,
+    WorkdirVolumeResourceLease,
+    retained_round_id,
+)
+from rsi_harness.runtime.redaction import redact_text
+from rsi_harness.runtime.resume import ResumeContext
+from rsi_harness.runtime.sandbox_budget import LeaseMutator
+from rsi_harness.runtime.submissions import (
+    EmbeddedJudgeServer,
+    JudgeEndpoint,
+    SubmissionService,
+)
+
+_TERMINAL = {
+    RunStatus.COMPLETED,
+    RunStatus.FAILED,
+    RunStatus.CANCELLED,
+    RunStatus.NO_VALID_SUBMISSION,
+}
+_ALLOWED = {
+    RunStatus.PREPARING: {
+        RunStatus.AGENT_RUNNING,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    },
+    RunStatus.AGENT_RUNNING: {
+        RunStatus.SNAPSHOTTING,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.NO_VALID_SUBMISSION,
+    },
+    RunStatus.SNAPSHOTTING: {
+        RunStatus.JUDGING,
+        RunStatus.AGENT_RUNNING,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    },
+    RunStatus.JUDGING: {
+        RunStatus.AGENT_RUNNING,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    },
+}
+
+
+class _RunCancelled(BaseException):
+    pass
+
+
+# How long the Agent keeps running after its one final-judge round returned,
+# so rsi-submit prints the result into its session before the Harness ends it.
+FINAL_FEEDBACK_GRACE_SECONDS = 10.0
+# A final round that a busy Work rejects is tried again this often.
+FINAL_ROUND_ATTEMPTS = 3
+FINAL_ROUND_RETRY_SECONDS = 5.0
+
+
+class AgentEndedEarlyError(RuntimeError):
+    """A final-judge attempt whose Agent failed before its time ended."""
+
+
+def _judged_end(result: AgentRunResult) -> bool:
+    """Whether a final-judge attempt's Agent ended in a way that is judged:
+    its time ran out, its model provider stopped it, or it exited cleanly."""
+    return (
+        result.timed_out or result.provider_error is not None or result.exit_code == 0
+    )
+
+
+def _judge_final(service: Any) -> None:
+    """Run the Harness's final round off the main thread: a signal then
+    interrupts only the wait, and the service drain finishes the round."""
+    outcome: list[BaseException] = []
+
+    def judge() -> None:
+        try:
+            for attempt in range(1, FINAL_ROUND_ATTEMPTS + 1):
+                try:
+                    service.judge_final()
+                    return
+                except RetryableSubmissionError:
+                    if attempt == FINAL_ROUND_ATTEMPTS:
+                        raise
+                    time.sleep(FINAL_ROUND_RETRY_SECONDS)
+        except BaseException as error:
+            outcome.append(error)
+
+    worker = threading.Thread(target=judge, name="rsi-final-judge", daemon=True)
+    worker.start()
+    while worker.is_alive():
+        worker.join(0.5)
+    if outcome:
+        raise outcome[0]
+
+
+class _FinalRoundEnder:
+    """End a final-judge Agent once its one rsi-submit round has returned
+    and FINAL_FEEDBACK_GRACE_SECONDS have passed. The Harness ends it, so no
+    stop hook can keep it working on what can no longer count."""
+
+    # None: FINAL_FEEDBACK_GRACE_SECONDS, read once the round is done.
+    grace_seconds: float | None = None
+    thread_name = "rsi-final-round-end"
+
+    def __init__(self, round_done: threading.Event, end: Callable[[], None]) -> None:
+        self._round_done = round_done
+        self._end = end
+        self._finished = threading.Event()
+        self.ended = False
+        self.error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._watch, name=self.thread_name, daemon=True
+        )
+        self._thread.start()
+
+    def _watch(self) -> None:
+        while not self._round_done.wait(0.2):
+            if self._finished.is_set():
+                return
+        grace = (
+            FINAL_FEEDBACK_GRACE_SECONDS
+            if self.grace_seconds is None
+            else self.grace_seconds
+        )
+        if self._finished.wait(grace):
+            return
+        try:
+            self._end()
+            self.ended = True
+        except BaseException as error:
+            self.error = error
+
+    def finish(self) -> None:
+        """The Agent's exec returned: stop watching, after any end in progress."""
+        self._finished.set()
+        self._thread.join()
+
+
+class _RecoveryEnder(_FinalRoundEnder):
+    """End the Agent at once when a round leaves Work paused for recovery.
+
+    Such a round closes submissions and keeps Work paused for ``recover``:
+    the Agent can no longer run, nor read its ``rsi-submit`` reply. Waiting
+    for its exec only spends the rest of its time, after which the timed-out
+    exec kills the paused Work anyway. Ending it now does the same, earlier,
+    and leaves that time to ``resume``.
+    """
+
+    grace_seconds = 0.0
+    thread_name = "rsi-recovery-end"
+
+
+def _agent_provider_record(result: AgentRunResult | None) -> dict[str, object]:
+    """final_result.json's ``agent_provider``, where the Agent met model
+    provider errors: the retries, their waits, and the error it ended on."""
+    if result is None or (not result.provider_retries and not result.provider_error):
+        return {}
+    return {
+        "agent_provider": {
+            "error": result.provider_error,
+            "retries": result.provider_retries,
+            "wait_seconds": result.provider_wait_seconds,
+        }
+    }
+
+
+@contextmanager
+def _cancellation_signals() -> Iterator[None]:
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous: dict[signal.Signals, Any] = {}
+
+    def ignore(signum: int, frame: object) -> None:
+        del signum, frame
+
+    def cancel(signum: int, frame: object) -> None:
+        del frame
+        # Once: a later signal (LSF's bkill sends SIGINT then SIGTERM, and a
+        # cluster job script forwards one more) must not interrupt the
+        # cleanup that closes the attempt. A Python handler, not SIG_IGN,
+        # so the processes cleanup starts do not inherit it.
+        for selected in previous:
+            signal.signal(selected, ignore)
+        raise _RunCancelled(f"received signal {signum}")
+
+    try:
+        for selected in (signal.SIGINT, signal.SIGTERM):
+            previous[selected] = signal.getsignal(selected)
+            signal.signal(selected, cancel)
+        yield
+    finally:
+        for selected, handler in previous.items():
+            signal.signal(selected, handler)
+
+
+class SubmissionServerOwner(Protocol):
+    def stop(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class StartedSubmissionServer:
+    """A started owner paired with the endpoint actually bound by that owner."""
+
+    service: Any
+    owner: SubmissionServerOwner
+    endpoint: JudgeEndpoint
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddedSubmissionServerFactory:
+    """Production composition for SubmissionService + EmbeddedJudgeServer."""
+
+    bind_host: str
+    port: int
+    bridge_gateway: str
+    startup_timeout_seconds: float = 5.0
+    shutdown_timeout_seconds: float = 10.0
+
+    def __call__(
+        self, evaluator: Any, artifacts: Any, clock: Any
+    ) -> StartedSubmissionServer:
+        service = SubmissionService(
+            evaluator=evaluator,
+            artifact_writer=artifacts,
+            clock=clock,
+        )
+        owner = EmbeddedJudgeServer(
+            service,
+            bind_host=self.bind_host,
+            port=self.port,
+            bridge_gateway=self.bridge_gateway,
+            startup_timeout_seconds=self.startup_timeout_seconds,
+            shutdown_timeout_seconds=self.shutdown_timeout_seconds,
+        )
+        endpoint = owner.start()
+        return StartedSubmissionServer(
+            service=service,
+            owner=owner,
+            endpoint=endpoint,
+        )
+
+
+class CoordinatorBackend(Protocol):
+    """Mandatory production-capable ports owned in order by the coordinator."""
+
+    def compile(self, request: RunRequest) -> Any: ...
+
+    def allocate(self, definition: Any, selectors: Sequence[str]) -> Any: ...
+
+    def prepare_images(self, definition: Any) -> Any: ...
+
+    def prepare_plan(
+        self,
+        definition: Any,
+        images: Any,
+        allocation: Any,
+        request: RunRequest,
+        run_id: str,
+    ) -> Any: ...
+
+    def start_artifacts(self, plan: Any, run_id: str) -> Any: ...
+
+    def start_server(
+        self, evaluator: Any, artifacts: Any, clock: Any
+    ) -> StartedSubmissionServer: ...
+
+    def plan_network(self, plan: Any, run_id: str) -> str: ...
+
+    def create_network(
+        self, plan: Any, run_id: str, planned: str
+    ) -> ManagedNetwork: ...
+
+    def remove_network(self, network: ManagedNetwork) -> None: ...
+
+    def plan_work_container(self, plan: Any, run_id: str) -> str: ...
+
+    def plan_workdir_volume(
+        self, plan: Any, run_id: str
+    ) -> ManagedWorkdirVolume | None: ...
+
+    def create_workdir_volume(
+        self, plan: Any, run_id: str, planned: ManagedWorkdirVolume
+    ) -> ManagedWorkdirVolume: ...
+
+    def attest_workdir_volume(
+        self, work: ContainerRef, volume: ManagedWorkdirVolume
+    ) -> None: ...
+
+    def attest_work_feedback_mount(self, work: ContainerRef) -> None: ...
+
+    def remove_workdir_volume(self, volume: ManagedWorkdirVolume) -> None: ...
+
+    def adopt_workdir_volume(
+        self, plan: Any, run_id: str, volume: ManagedWorkdirVolume
+    ) -> ManagedWorkdirVolume: ...
+
+    def create_work(
+        self,
+        plan: Any,
+        run_id: str,
+        network: ManagedNetwork,
+        planned_name: str,
+        workdir_volume: ManagedWorkdirVolume | None,
+    ) -> ContainerRef: ...
+
+    def plan_work_policy(
+        self, plan: Any, work: ContainerRef, network: ManagedNetwork
+    ) -> str: ...
+
+    def install_work_policy(
+        self, plan: Any, work: ContainerRef, network: ManagedNetwork
+    ) -> str: ...
+
+    def remove_work_policy(self, rule_id: str) -> None: ...
+
+    def start_work(self, work: ContainerRef) -> None: ...
+
+    def remove_work(self, work: ContainerRef) -> None: ...
+
+    def install_hooks(
+        self, plan: Any, work: ContainerRef, submit_url: str, token: str
+    ) -> None: ...
+
+    def prepare_agent(self, plan: Any, max_submissions: int | None = None) -> Any: ...
+
+    def run_agent(
+        self, prepared: Any, work: ContainerRef, timeout: float | None
+    ) -> AgentRunResult: ...
+
+    def stop_agent(self, work: ContainerRef) -> None: ...
+
+    def end_agent(self, work: ContainerRef) -> None:
+        """End the Agent's processes while its exec is still being awaited:
+        a final-judge run's Agent once its one round returned."""
+        ...
+
+    def quiesce_work(self, work: ContainerRef) -> WorkQuiescence: ...
+
+    def plan_retained_work(self, plan: Any, work: ContainerRef) -> str: ...
+
+    def retain_work(
+        self, plan: Any, work: ContainerRef, planned_ref: str
+    ) -> RootfsSnapshotLease: ...
+
+    def release_retained_work(self, retained: RootfsSnapshotLease) -> None: ...
+
+    def evaluate_submission(
+        self,
+        request: EvaluationRequest,
+        *,
+        lifecycle_observer: RoundLifecycleObserver,
+    ) -> SubmissionReport: ...
+
+    def record_event(self, name: str, value: object) -> None: ...
+
+
+class RoundLifecycleObserver(Protocol):
+    def resource_event(self, name: str, **values: object) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RunPreparation:
+    """One immutable compile/allocation result authorized before runtime mutation."""
+
+    request: RunRequest
+    definition: TaskDefinition
+    gpu_plan: RunGPUPlan
+
+
+@dataclass(slots=True)
+class ProductionCoordinatorBackend:
+    """Concrete typed composition over production ports and phase factories.
+
+    The callables are construction seams, not optional behavior: a composition
+    cannot omit evaluation, networking, server ownership, or Agent termination.
+    """
+
+    compiler: Any
+    allocator: Callable[[Any, Sequence[str]], Any]
+    image_preparer: Callable[[Any], Any]
+    plan_preparer: Callable[[Any, Any, Any, RunRequest, str], Any]
+    artifact_starter: Callable[[Any, str], Any]
+    server_starter: Callable[[Any, Any, Any], StartedSubmissionServer]
+    network_planner: Callable[[Any, str], str]
+    network_creator: Callable[[Any, str, str], ManagedNetwork]
+    network_remover: Callable[[ManagedNetwork], None]
+    workdir_volume_planner: Callable[[Any, str], ManagedWorkdirVolume | None]
+    workdir_volume_creator: Callable[
+        [Any, str, ManagedWorkdirVolume], ManagedWorkdirVolume
+    ]
+    workdir_volume_attester: Callable[[ContainerRef, ManagedWorkdirVolume], None]
+    workdir_volume_remover: Callable[[ManagedWorkdirVolume], None]
+    work_name_planner: Callable[[Any, str], str]
+    work_creator: Callable[
+        [Any, str, ManagedNetwork, str, ManagedWorkdirVolume | None],
+        ContainerRef,
+    ]
+    work_feedback_attester: Callable[[ContainerRef], None]
+    work_policy_planner: Callable[[Any, ContainerRef, ManagedNetwork], str]
+    work_policy_installer: Callable[[Any, ContainerRef, ManagedNetwork], str]
+    work_policy_remover: Callable[[str], None]
+    work_starter: Callable[[ContainerRef], None]
+    work_remover: Callable[[ContainerRef], None]
+    hook_installer: Callable[[Any, ContainerRef, str, str], None]
+    agent_preparer: Callable[[Any, int | None], Any]
+    agent_runner: Callable[[Any, ContainerRef, float | None], AgentRunResult]
+    agent_stopper: Callable[[ContainerRef], None]
+    work_quiescer: Callable[[ContainerRef], WorkQuiescence]
+    retained_work_planner: Callable[[Any, ContainerRef], str]
+    work_retainer: Callable[[Any, ContainerRef, str], RootfsSnapshotLease]
+    retained_work_releaser: Callable[[RootfsSnapshotLease], None]
+    evaluator: Callable[[EvaluationRequest, RoundLifecycleObserver], SubmissionReport]
+    event_recorder: Callable[[str, object], None] = lambda _name, _value: None
+    preparation: RunPreparation | None = None
+    # Only a backend that can resume a run keeps its WORKDIR volume.
+    workdir_volume_adopter: (
+        Callable[[Any, str, ManagedWorkdirVolume], ManagedWorkdirVolume] | None
+    ) = None
+    # Only a backend that runs final-judge tasks ends an Agent early.
+    agent_ender: Callable[[ContainerRef], None] | None = None
+
+    def compile(self, request: RunRequest) -> Any:
+        if self.preparation is not None:
+            if request != self.preparation.request:
+                raise SetupError("coordinator request differs from prevalidated run")
+            return self.preparation.definition
+        return self.compiler.compile(request.task_dir, request.options)
+
+    def allocate(self, definition: Any, selectors: Sequence[str]) -> Any:
+        if self.preparation is not None:
+            if definition is not self.preparation.definition:
+                raise SetupError(
+                    "GPU allocation definition differs from prevalidated run"
+                )
+            if tuple(selectors) != tuple(self.preparation.request.gpu_selectors):
+                raise SetupError("GPU selectors differ from prevalidated run")
+            return self.preparation.gpu_plan
+        return self.allocator(definition, selectors)
+
+    def prepare_images(self, definition: Any) -> Any:
+        return self.image_preparer(definition)
+
+    def prepare_plan(
+        self,
+        definition: Any,
+        images: Any,
+        gpu_plan: Any,
+        request: RunRequest,
+        run_id: str,
+    ) -> Any:
+        return self.plan_preparer(definition, images, gpu_plan, request, run_id)
+
+    def start_artifacts(self, plan: Any, run_id: str) -> Any:
+        return self.artifact_starter(plan, run_id)
+
+    def start_server(
+        self, evaluator: Any, artifacts: Any, clock: Any
+    ) -> StartedSubmissionServer:
+        return self.server_starter(evaluator, artifacts, clock)
+
+    def plan_network(self, plan: Any, run_id: str) -> str:
+        return self.network_planner(plan, run_id)
+
+    def create_network(self, plan: Any, run_id: str, planned: str) -> ManagedNetwork:
+        return self.network_creator(plan, run_id, planned)
+
+    def remove_network(self, network: ManagedNetwork) -> None:
+        self.network_remover(network)
+
+    def plan_work_container(self, plan: Any, run_id: str) -> str:
+        return self.work_name_planner(plan, run_id)
+
+    def plan_workdir_volume(
+        self, plan: Any, run_id: str
+    ) -> ManagedWorkdirVolume | None:
+        return self.workdir_volume_planner(plan, run_id)
+
+    def create_workdir_volume(
+        self, plan: Any, run_id: str, planned: ManagedWorkdirVolume
+    ) -> ManagedWorkdirVolume:
+        return self.workdir_volume_creator(plan, run_id, planned)
+
+    def attest_workdir_volume(
+        self, work: ContainerRef, volume: ManagedWorkdirVolume
+    ) -> None:
+        self.workdir_volume_attester(work, volume)
+
+    def remove_workdir_volume(self, volume: ManagedWorkdirVolume) -> None:
+        self.workdir_volume_remover(volume)
+
+    def adopt_workdir_volume(
+        self, plan: Any, run_id: str, volume: ManagedWorkdirVolume
+    ) -> ManagedWorkdirVolume:
+        if self.workdir_volume_adopter is None:
+            raise SetupError("this runtime cannot resume a run")
+        return self.workdir_volume_adopter(plan, run_id, volume)
+
+    def create_work(
+        self,
+        plan: Any,
+        run_id: str,
+        network: ManagedNetwork,
+        planned_name: str,
+        workdir_volume: ManagedWorkdirVolume | None,
+    ) -> ContainerRef:
+        return self.work_creator(plan, run_id, network, planned_name, workdir_volume)
+
+    def attest_work_feedback_mount(self, work: ContainerRef) -> None:
+        self.work_feedback_attester(work)
+
+    def start_work(self, work: ContainerRef) -> None:
+        self.work_starter(work)
+
+    def plan_work_policy(
+        self, plan: Any, work: ContainerRef, network: ManagedNetwork
+    ) -> str:
+        return self.work_policy_planner(plan, work, network)
+
+    def install_work_policy(
+        self, plan: Any, work: ContainerRef, network: ManagedNetwork
+    ) -> str:
+        return self.work_policy_installer(plan, work, network)
+
+    def remove_work_policy(self, rule_id: str) -> None:
+        self.work_policy_remover(rule_id)
+
+    def remove_work(self, work: ContainerRef) -> None:
+        self.work_remover(work)
+
+    def install_hooks(
+        self, plan: Any, work: ContainerRef, submit_url: str, token: str
+    ) -> None:
+        self.hook_installer(plan, work, submit_url, token)
+
+    def prepare_agent(self, plan: Any, max_submissions: int | None = None) -> Any:
+        return self.agent_preparer(plan, max_submissions)
+
+    def run_agent(
+        self, prepared: Any, work: ContainerRef, timeout: float | None
+    ) -> AgentRunResult:
+        return self.agent_runner(prepared, work, timeout)
+
+    def stop_agent(self, work: ContainerRef) -> None:
+        self.agent_stopper(work)
+
+    def end_agent(self, work: ContainerRef) -> None:
+        if self.agent_ender is None:
+            raise SetupError("this runtime cannot end an Agent early")
+        self.agent_ender(work)
+
+    def quiesce_work(self, work: ContainerRef) -> WorkQuiescence:
+        return self.work_quiescer(work)
+
+    def plan_retained_work(self, plan: Any, work: ContainerRef) -> str:
+        return self.retained_work_planner(plan, work)
+
+    def retain_work(
+        self, plan: Any, work: ContainerRef, planned_ref: str
+    ) -> RootfsSnapshotLease:
+        return self.work_retainer(plan, work, planned_ref)
+
+    def release_retained_work(self, retained: RootfsSnapshotLease) -> None:
+        self.retained_work_releaser(retained)
+
+    def evaluate_submission(
+        self,
+        request: EvaluationRequest,
+        *,
+        lifecycle_observer: RoundLifecycleObserver,
+    ) -> SubmissionReport:
+        return self.evaluator(request, lifecycle_observer)
+
+    def record_event(self, name: str, value: object) -> None:
+        self.event_recorder(name, value)
+
+
+class CoordinatorState:
+    """Small strict state machine whose invalid edges are Engine defects."""
+
+    def __init__(self, *, run_id: str) -> None:
+        self.run_id = run_id
+        self._status = RunStatus.PREPARING
+        self._history = [self._status]
+        self.engine_errors: list[str] = []
+
+    @property
+    def status(self) -> RunStatus:
+        return self._status
+
+    @property
+    def history(self) -> tuple[RunStatus, ...]:
+        return tuple(self._history)
+
+    def transition(self, status: RunStatus) -> None:
+        if status not in _ALLOWED.get(self._status, set()):
+            error = StateTransitionError(
+                f"invalid coordinator transition {self._status.value} -> "
+                f"{status.value} for {self.run_id}"
+            )
+            self.engine_errors.append(f"StateTransitionError: {error}")
+            raise error
+        self._status = status
+        self._history.append(status)
+
+
+class _RoundEvaluator:
+    def __init__(
+        self,
+        *,
+        backend: CoordinatorBackend,
+        state: CoordinatorState,
+        transition: Callable[[RunStatus], None],
+        persist_recovery: Callable[[str], None],
+        update_work: Callable[..., None],
+        update_judge: Callable[..., None],
+        sandbox_lifecycle: Any = None,
+    ) -> None:
+        from rsi_harness.runtime.sandbox_lifecycle import NullSandboxLifecycle
+
+        self._sandbox_lifecycle = sandbox_lifecycle or NullSandboxLifecycle()
+        self._backend = backend
+        self._state = state
+        self._transition = transition
+        self._persist_recovery = persist_recovery
+        self._update_work = update_work
+        self._update_judge = update_judge
+        self.reports: list[SubmissionReport] = []
+        # Monotonic start of the first round that returned a report.
+        self.first_round_started: float | None = None
+        self.recovery_required = False
+        self.recovery_error: str | None = None
+        self.submission_closed = False
+        # Set once a round ended requiring recovery with Work still paused
+        # for it: Work stays paused, so the Agent can no longer run.
+        self.work_held = threading.Event()
+
+    def _hold_paused_work(self) -> None:
+        if self.recovery_required and self._state.status in {
+            RunStatus.SNAPSHOTTING,
+            RunStatus.JUDGING,
+        }:
+            self.work_held.set()
+
+    def evaluate(self, request: EvaluationRequest) -> SubmissionReport:
+        if self.recovery_required or self.submission_closed:
+            raise InfrastructureError(
+                "submissions are closed after a required runtime write failed"
+            )
+        round_started = time.monotonic()
+        try:
+            report = self._backend.evaluate_submission(request, lifecycle_observer=self)
+        except StateTransitionError:
+            raise
+        except Exception:
+            if (
+                not self.recovery_required
+                and self._sandbox_lifecycle.can_resume
+                and self._state.status
+                in {
+                    RunStatus.SNAPSHOTTING,
+                    RunStatus.JUDGING,
+                }
+            ):
+                self._transition(RunStatus.AGENT_RUNNING)
+                self._backend.record_event(
+                    "work_resume", request.work_container.container_id
+                )
+            elif (
+                not self.recovery_required
+                and self._sandbox_lifecycle.work_ended_normally
+                and self._state.status
+                in {
+                    RunStatus.SNAPSHOTTING,
+                    RunStatus.JUDGING,
+                }
+            ):
+                # As below: Work ended during this round and stays paused.
+                self._transition(RunStatus.AGENT_RUNNING)
+            self._hold_paused_work()
+            raise
+        if not isinstance(report, SubmissionReport):
+            raise TypeError("submission evaluator must return SubmissionReport")
+        if self.first_round_started is None:
+            self.first_round_started = round_started
+        self.reports.append(report)
+        self.recovery_required = bool(
+            report.status == SubmissionStatus.INFRASTRUCTURE_ERROR
+            and report.error
+            and "recovery_required" in report.error
+        )
+        if self.recovery_required:
+            self.recovery_error = report.error
+            self._persist_recovery(report.error or "recovery_required")
+            self._hold_paused_work()
+        elif (
+            self._sandbox_lifecycle.can_resume
+            and self._state.status != RunStatus.AGENT_RUNNING
+        ):
+            self._transition(RunStatus.AGENT_RUNNING)
+            self._backend.record_event(
+                "work_resume", request.work_container.container_id
+            )
+        elif self._sandbox_lifecycle.work_ended_normally and self._state.status in {
+            RunStatus.SNAPSHOTTING,
+            RunStatus.JUDGING,
+        }:
+            # Work ended during this round and stays paused for removal;
+            # only the round phase closes, nothing is resumed.
+            self._transition(RunStatus.AGENT_RUNNING)
+        return report
+
+    def resource_event(self, name: str, **values: object) -> None:
+        """Persist typed lifecycle notifications emitted at mutation boundaries."""
+        if name == "workdir_volume_planned":
+            planned = values.get("planned")
+            if not isinstance(planned, ManagedWorkdirVolume):
+                raise InfrastructureError(
+                    "WORKDIR volume plan returned untyped authority"
+                )
+            self._update_work(
+                workdir_volume=WorkdirVolumeResourceLease(
+                    planned_name=planned.name,
+                    planned_target=planned.target,
+                    planned_snapshot_mode=planned.snapshot_mode,
+                    planned_freshness_nonce=planned.freshness_nonce,
+                )
+            )
+        elif name == "workdir_volume_created":
+            planned = values.get("planned")
+            if not isinstance(planned, ManagedWorkdirVolume):
+                raise InfrastructureError(
+                    "WORKDIR volume plan returned untyped authority"
+                )
+            actual = values.get("actual")
+            rollback = values.get("rollback")
+            if actual is not None and not isinstance(actual, ManagedWorkdirVolume):
+                raise InfrastructureError(
+                    "WORKDIR volume create returned untyped authority"
+                )
+            if rollback is not None and not isinstance(rollback, ManagedWorkdirVolume):
+                raise InfrastructureError(
+                    "WORKDIR volume rollback returned untyped authority"
+                )
+            if (actual is None) == (rollback is None):
+                raise InfrastructureError(
+                    "WORKDIR volume create event requires one exact authority"
+                )
+            self._update_work(
+                workdir_volume=WorkdirVolumeResourceLease(
+                    planned_name=planned.name,
+                    planned_target=planned.target,
+                    planned_snapshot_mode=planned.snapshot_mode,
+                    planned_freshness_nonce=planned.freshness_nonce,
+                    actual=actual,
+                    rollback=rollback,
+                )
+            )
+        elif name == "workdir_volume_mounted":
+            actual = values["actual"]
+            if not isinstance(actual, ManagedWorkdirVolume):
+                raise InfrastructureError(
+                    "WORKDIR volume mount returned untyped authority"
+                )
+            self._update_work(
+                workdir_volume=WorkdirVolumeResourceLease(
+                    planned_name=actual.name,
+                    planned_target=actual.target,
+                    planned_snapshot_mode=actual.snapshot_mode,
+                    planned_freshness_nonce=actual.freshness_nonce,
+                    actual=actual,
+                    mounted=True,
+                )
+            )
+        elif name == "workdir_volume_removed":
+            self._update_work(workdir_volume=WorkdirVolumeResourceLease())
+        elif name == "work_pause_planned":
+            if self._state.status == RunStatus.AGENT_RUNNING:
+                self._transition(RunStatus.SNAPSHOTTING)
+            self._update_work(paused=True, paused_at=time.time())
+        elif name == "snapshot_planned":
+            round_id = str(values["round_id"])
+            self._update_judge(
+                round_id=round_id,
+                planned_snapshot=f"snapshot:{self._state.run_id}:{round_id}",
+                planned_snapshot_ref=values.get("planned_snapshot_ref"),
+            )
+        elif name == "snapshot_acquired":
+            image_authority = values.get("snapshot_image_id") is not None
+            self._update_judge(
+                snapshot_lease_id=values.get("snapshot_lease_id"),
+                snapshot_image_id=values.get("snapshot_image_id"),
+                snapshot_image_ref=values.get("snapshot_image_ref"),
+                snapshot_source_container_id=values.get("snapshot_source_container_id"),
+                snapshot_merged_path=(
+                    None if image_authority else values.get("snapshot_merged_path")
+                ),
+                snapshot_process_id=(
+                    None if image_authority else values.get("snapshot_process_id")
+                ),
+            )
+        elif name == "snapshot_cancelled":
+            self._update_judge(
+                planned_snapshot=None,
+                planned_snapshot_ref=None,
+                snapshot_lease_id=None,
+                snapshot_image_id=None,
+                snapshot_image_ref=None,
+                snapshot_source_container_id=None,
+                snapshot_merged_path=None,
+                snapshot_process_id=None,
+            )
+        elif name in {"judge_planned", "judge_container_planned"}:
+            if self._state.status == RunStatus.SNAPSHOTTING:
+                self._transition(RunStatus.JUDGING)
+            round_id = str(values.get("round_id", "unknown"))
+            planned = values.get(
+                "planned_name", f"rsi-{self._state.run_id}-{round_id}-judge"
+            )
+            self._update_judge(round_id=round_id, planned_container=planned)
+        elif name in {"judge_created", "judge_container_created"}:
+            self._update_judge(container_id=values.get("judge_container_id"))
+        elif name == "judge_network_planned":
+            self._update_judge(planned_network=values.get("planned_name"))
+        elif name == "judge_network_created":
+            self._update_judge(
+                network_id=values.get("network_id"),
+                network_name=values.get("network_name"),
+            )
+        elif name == "judge_policy_installed":
+            self._update_judge(
+                planned_policy_rule_id=values.get("policy_rule_id"),
+                policy_rule_id=values.get("policy_rule_id"),
+            )
+        elif name == "judge_policy_planned":
+            self._update_judge(planned_policy_rule_id=values.get("policy_rule_id"))
+        elif name == "judge_removed":
+            self._update_judge(container_id=None, planned_container=None)
+        elif name == "judge_policy_removed":
+            self._update_judge(planned_policy_rule_id=None, policy_rule_id=None)
+        elif name == "judge_network_removed":
+            self._update_judge(network_id=None, network_name=None, planned_network=None)
+        elif name == "snapshot_released":
+            self._update_judge(
+                planned_snapshot=None,
+                planned_snapshot_ref=None,
+                snapshot_lease_id=None,
+                snapshot_image_id=None,
+                snapshot_image_ref=None,
+                snapshot_source_container_id=None,
+                snapshot_merged_path=None,
+                snapshot_process_id=None,
+            )
+        elif name == "work_unpaused":
+            if self._state.status in {RunStatus.SNAPSHOTTING, RunStatus.JUDGING}:
+                self._transition(RunStatus.AGENT_RUNNING)
+            self._update_work(paused=False, paused_at=None)
+        elif name == "work_recovery_state":
+            paused = bool(values.get("paused"))
+            self._update_work(
+                planned_quiescence=None,
+                paused=paused,
+                stopped=bool(values.get("stopped")),
+                **({} if paused else {"paused_at": None}),
+            )
+        elif name == "work_quiescence_unproven":
+            self._update_work(
+                planned_quiescence="pause-if-running",
+                paused=False,
+                paused_at=None,
+                stopped=False,
+            )
+        elif name == "recovery_required":
+            # Close the in-memory submission authority before any durable or
+            # artifact operation can itself fail.
+            self.recovery_required = True
+            context = str(values.get("recovery_context", name))
+            self.recovery_error = (
+                context
+                if "recovery_required" in context
+                else f"recovery_required: {context}"
+            )
+            self._persist_recovery(self.recovery_error)
+        elif name == "submission_closed":
+            # No isolation authority exists before Work pause. Close only the
+            # submission stream; normal coordinator cleanup must still stop
+            # and remove the running Work container and network.
+            self.submission_closed = True
+
+    def judge_network_planned(self, round_id: str, planned_name: str) -> None:
+        self.resource_event(
+            "judge_network_planned",
+            round_id=round_id,
+            planned_name=planned_name,
+        )
+
+    def judge_network_created(self, round_id: str, network: ManagedNetwork) -> None:
+        self.resource_event(
+            "judge_network_created",
+            round_id=round_id,
+            network_id=network.network_id,
+            network_name=network.name,
+        )
+
+    def judge_container_planned(self, round_id: str, planned_name: str) -> None:
+        self.resource_event(
+            "judge_container_planned",
+            round_id=round_id,
+            planned_name=planned_name,
+        )
+
+    def judge_container_created(self, round_id: str, container: ContainerRef) -> None:
+        self.resource_event(
+            "judge_container_created",
+            round_id=round_id,
+            judge_container_id=container.container_id,
+        )
+
+    def judge_policy_planned(self, round_id: str, rule_id: str) -> None:
+        self.resource_event(
+            "judge_policy_planned", round_id=round_id, policy_rule_id=rule_id
+        )
+
+    def judge_policy_installed(self, round_id: str, policy: Any) -> None:
+        self.resource_event(
+            "judge_policy_installed",
+            round_id=round_id,
+            policy_rule_id=policy.rule_id,
+        )
+
+    def judge_container_removed(self, round_id: str, container_id: str) -> None:
+        self.resource_event(
+            "judge_removed", round_id=round_id, judge_container_id=container_id
+        )
+
+    def judge_policy_removed(self, round_id: str, rule_id: str) -> None:
+        self.resource_event(
+            "judge_policy_removed", round_id=round_id, policy_rule_id=rule_id
+        )
+
+    def judge_network_removed(self, round_id: str, network_id: str) -> None:
+        self.resource_event(
+            "judge_network_removed", round_id=round_id, network_id=network_id
+        )
+
+
+class RunCoordinator:
+    """Own the complete run sequence through mandatory injected ports."""
+
+    def __init__(
+        self,
+        *,
+        backend: CoordinatorBackend,
+        lease_store: LeaseStore,
+        run_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
+        clock: Any,
+        on_lease_ready: Callable[[LeaseMutator], None] | None = None,
+        sandbox_lifecycle: Any = None,
+        resume: ResumeContext | None = None,
+    ) -> None:
+        from rsi_harness.runtime.sandbox_lifecycle import NullSandboxLifecycle
+
+        self._sandbox_lifecycle = sandbox_lifecycle or NullSandboxLifecycle()
+        self._backend = backend
+        self._leases = lease_store
+        self._run_id_factory = run_id_factory
+        self._clock = clock
+        self._on_lease_ready = on_lease_ready
+        # The next attempt of an earlier run, which keeps its run ID.
+        self._resume = resume
+        self.phase_history: tuple[RunStatus, ...] = ()
+
+    def run(self, request: RunRequest) -> RunResult:
+        run_id = str(self._run_id_factory())
+        resume = self._resume
+        if resume is not None and resume.run_id != run_id:
+            raise SetupError("a resumed attempt must keep its run ID")
+        attempt = 1 if resume is None else resume.attempt
+        state = CoordinatorState(run_id=run_id)
+        started_at = time.monotonic()
+        lease: ResourceLease | None = None
+        plan: Any = None
+        final_judge = False
+        # The attempt's round was the Harness's, not the Agent's rsi-submit.
+        harness_judged = False
+        artifacts: Any = None
+        evaluator: _RoundEvaluator | None = None
+        server: StartedSubmissionServer | None = None
+        network: ManagedNetwork | None = None
+        work: ContainerRef | None = None
+        planned_workdir_volume: ManagedWorkdirVolume | None = None
+        actual_workdir_volume: ManagedWorkdirVolume | None = None
+        rollback_workdir_volume: ManagedWorkdirVolume | None = None
+        workdir_volume_mounted = False
+        workdir_volume_authority_known = False
+        setup_recovery_required = False
+        setup_recovery_error: str | None = None
+        agent_stopped = False
+        work_quiescence: WorkQuiescence | None = None
+        planned_retained_work: str | None = None
+        retained_work: RootfsSnapshotLease | None = None
+        retained_work_rollback: RootfsSnapshotLease | None = None
+        agent_result: AgentRunResult | None = None
+        agent_started_at: float | None = None
+        agent_runtime_seconds: float | None = None
+        agent_timeout: float | None = None
+        # The lease a resumed run ended with, rewritten if its attempt never
+        # starts.
+        resumed_from: ResourceLease | None = None
+        drained = False
+        drain_failed = False
+        work_removed = False
+        network_removed = False
+        work_policy_removed = False
+        work_policy_id: str | None = None
+        captured: BaseException | None = None
+        cancelled = False
+        cleanup_errors: list[str] = []
+        retention_attempted = False
+        retained_identity_durable = False
+        cleanup_blocked = False
+        authority = threading.RLock()
+        resources = ExitStack()
+
+        def write(updated: ResourceLease) -> None:
+            nonlocal lease
+            with authority:
+                if workdir_volume_authority_known:
+                    updated = updated.model_copy(
+                        update={
+                            "work": updated.work.model_copy(
+                                update={
+                                    "workdir_volume": WorkdirVolumeResourceLease(
+                                        planned_name=(
+                                            None
+                                            if planned_workdir_volume is None
+                                            else planned_workdir_volume.name
+                                        ),
+                                        planned_target=(
+                                            None
+                                            if planned_workdir_volume is None
+                                            else planned_workdir_volume.target
+                                        ),
+                                        planned_snapshot_mode=(
+                                            None
+                                            if planned_workdir_volume is None
+                                            else planned_workdir_volume.snapshot_mode
+                                        ),
+                                        planned_freshness_nonce=(
+                                            None
+                                            if planned_workdir_volume is None
+                                            else planned_workdir_volume.freshness_nonce
+                                        ),
+                                        actual=actual_workdir_volume,
+                                        rollback=rollback_workdir_volume,
+                                        mounted=workdir_volume_mounted,
+                                    )
+                                }
+                            )
+                        }
+                    )
+                if setup_recovery_required:
+                    marker = setup_recovery_error or (
+                        "recovery_required: WORKDIR volume authority retained"
+                    )
+                    detail = updated.error
+                    if detail and marker not in detail:
+                        detail = f"{marker}; {detail}"
+                    else:
+                        detail = marker
+                    updated = updated.model_copy(
+                        update={
+                            "recovery_required": True,
+                            "error": detail,
+                        }
+                    )
+                if evaluator is not None and evaluator.recovery_required:
+                    marker = evaluator.recovery_error or (
+                        "recovery_required: in-memory recovery authority retained"
+                    )
+                    detail = updated.error
+                    if detail and marker not in detail:
+                        detail = f"{marker}; {detail}"
+                    else:
+                        detail = marker
+                    updated = updated.model_copy(
+                        update={
+                            "recovery_required": True,
+                            "work": updated.work.model_copy(
+                                update={"paused": True, "stopped": False}
+                            ),
+                            "error": detail,
+                        }
+                    )
+                self._leases.write(updated)
+                lease = updated
+
+        def mutate_lease(
+            transform: Callable[[ResourceLease], ResourceLease],
+        ) -> ResourceLease:
+            with authority:
+                if lease is None:
+                    raise InfrastructureError("run lease is not initialized")
+                updated = transform(lease)
+                if updated is not lease:
+                    write(updated)
+                assert lease is not None
+                return lease
+
+        def transition(status: RunStatus) -> None:
+            with authority:
+                state.transition(status)
+                if lease is None:
+                    return
+                history = lease.phase_history
+                if history[-1:] != (status.value,):
+                    history += (status.value,)
+                updates: dict[str, object] = {
+                    "phase": status.value,
+                    "phase_history": history,
+                }
+                current_attempt = lease.attempts[-1] if lease.attempts else None
+                if (
+                    status is RunStatus.AGENT_RUNNING
+                    and current_attempt is not None
+                    and current_attempt.agent_started_at is None
+                    and plan is not None
+                ):
+                    # The Agent's wall-clock budget starts now.
+                    now = time.time()
+                    assert agent_timeout is not None
+                    updates["attempts"] = (
+                        *lease.attempts[:-1],
+                        current_attempt.model_copy(
+                            update={
+                                "agent_started_at": now,
+                                "agent_deadline": now + agent_timeout,
+                            }
+                        ),
+                    )
+                mutate_lease(lambda current: current.model_copy(update=updates))
+
+        def update_work(**updates: object) -> None:
+            mutate_lease(
+                lambda current: current.model_copy(
+                    update={"work": current.work.model_copy(update=updates)}
+                )
+            )
+
+        def update_judge(**updates: object) -> None:
+            mutate_lease(
+                lambda current: current.model_copy(
+                    update={"judge": current.judge.model_copy(update=updates)}
+                )
+            )
+
+        def persist_recovery(message: str) -> None:
+            assert lease is not None
+            # A mutation may have succeeded even when its first identity fsync
+            # failed. Overlay every still-live coordinator-local authority on
+            # the last durable lease before marking recovery required.
+            work_updates: dict[str, object] = {}
+            if work is not None and not work_removed:
+                work_updates["container_id"] = work.container_id
+                if work_quiescence is not None:
+                    work_updates.update(
+                        {
+                            "planned_quiescence": None,
+                            "paused": work_quiescence is WorkQuiescence.PAUSED,
+                            "stopped": work_quiescence is WorkQuiescence.STOPPED,
+                        }
+                    )
+            elif work_removed:
+                work_updates.update(
+                    {
+                        "container_id": None,
+                        "planned_container": None,
+                        "paused": False,
+                        "stopped": False,
+                    }
+                )
+            if network is not None and not network_removed:
+                work_updates.update(
+                    {
+                        "network_id": network.network_id,
+                        "network_name": network.name,
+                    }
+                )
+            if work_policy_id is not None and not work_policy_removed:
+                # The planned ID was durably recorded before installation.
+                # Preserve it even when a buggy backend returns a different
+                # actual ID: recovery must retain both authorities.
+                work_updates["policy_rule_id"] = work_policy_id
+            if planned_retained_work is not None:
+                work_updates["planned_retained_image_ref"] = planned_retained_work
+            if retained_work is not None:
+                work_updates.update(
+                    {
+                        "retained_image_id": retained_work.image_id,
+                        "retained_image_ref": retained_work.image_ref,
+                    }
+                )
+            if retained_work_rollback is not None:
+                work_updates["retained_image_rollback"] = (
+                    RetainedImageRollbackAuthority(
+                        image_id=retained_work_rollback.image_id,
+                        image_ref=retained_work_rollback.image_ref,
+                    )
+                )
+            mutate_lease(
+                lambda current: current.model_copy(
+                    update={
+                        "recovery_required": True,
+                        "work": current.work.model_copy(update=work_updates),
+                        "error": redact_text(message),
+                    }
+                )
+            )
+
+        def retain_workdir_authority_after_write_failure(
+            stage: str, error: BaseException
+        ) -> None:
+            nonlocal setup_recovery_required, setup_recovery_error
+            setup_recovery_required = True
+            setup_recovery_error = redact_text(f"recovery_required: {stage}: {error}")
+            persist_recovery(setup_recovery_error)
+
+        sandbox_cancelled = sandbox_closed = sandbox_released = False
+
+        def quiesce_parent() -> bool:
+            """Contain execution even when resource deletion must remain blocked."""
+            nonlocal work_quiescence, cleanup_blocked
+            if work is None or work_removed or work_quiescence is not None:
+                return True
+            try:
+                update_work(planned_quiescence="pause-if-running")
+                observed = self._backend.quiesce_work(work)
+                work_quiescence = WorkQuiescence(observed)
+                paused_at = None
+                if work_quiescence is WorkQuiescence.PAUSED:
+                    # A snapshot pause already in force keeps its start.
+                    paused_at = (
+                        lease.work.paused_at
+                        if lease is not None and lease.work.paused
+                        else None
+                    ) or time.time()
+                update_work(
+                    planned_quiescence=None,
+                    paused=paused_at is not None,
+                    paused_at=paused_at,
+                    stopped=work_quiescence is WorkQuiescence.STOPPED,
+                )
+            except BaseException as error:
+                cleanup_errors.append(self._error(error))
+                cleanup_blocked = True
+                if lease is not None:
+                    persist_recovery(f"Work quiescence is unproven: {error}")
+                return False
+            close_attempt()
+            return True
+
+        def agent_contained() -> bool:
+            return (
+                work is None
+                or work_removed
+                or agent_stopped
+                or work_quiescence is not None
+            )
+
+        def close_attempt() -> None:
+            """Persist the Agent's exec span as soon as it can no longer run,
+            before cleanup discards the Work evidence recover would use."""
+            if (
+                lease is None
+                or not lease.attempts
+                or lease.attempts[-1].ended_at is not None
+            ):
+                return
+            try:
+                mutate_lease(
+                    lambda current: current.model_copy(
+                        update={"attempts": closed_attempts(current)}
+                    )
+                )
+            except BaseException as error:
+                cleanup_errors.append(self._error(error))
+
+        def closed_attempts(current: ResourceLease) -> tuple[RunAttemptLease, ...]:
+            return self._closed_attempts(
+                current,
+                agent_seconds=(
+                    0.0
+                    if agent_started_at is None
+                    else agent_runtime_seconds
+                    if agent_runtime_seconds is not None
+                    else max(0.0, time.monotonic() - agent_started_at)
+                ),
+                exited=agent_result is not None
+                and not agent_result.timed_out
+                and not agent_result.cancelled,
+            )
+
+        def cleanup_resources() -> None:
+            nonlocal drained, drain_failed, work_removed, network_removed
+            nonlocal work_policy_removed, agent_stopped, work_quiescence
+            nonlocal planned_retained_work, retained_work, retention_attempted
+            nonlocal retained_work_rollback
+            nonlocal cleanup_blocked, retained_identity_durable
+            nonlocal sandbox_cancelled, sandbox_closed, sandbox_released
+            if not sandbox_cancelled:
+                sandbox_cancelled = True
+                try:
+                    # Retire only Work so an accepted round is judged to
+                    # completion under its own deadline during the drain;
+                    # close() below still cancels the whole sandbox run.
+                    if cancelled:
+                        self._sandbox_lifecycle.cancel_run()
+                    else:
+                        self._sandbox_lifecycle.cancel_work()
+                except BaseException as error:
+                    cleanup_errors.append(self._error(error))
+                    cleanup_blocked = True
+                    if lease is not None:
+                        persist_recovery(f"sandbox revocation unproven: {error}")
+            # Even failed submission drains must revoke and stop endpoint services.
+            if server is not None and not drained and not drain_failed:
+                try:
+                    server.owner.stop()
+                    drained = True
+                except BaseException as error:
+                    drain_failed = True
+                    cleanup_errors.append(self._error(error))
+                    if lease is not None:
+                        persist_recovery(f"server drain unproven: {error}")
+            if not sandbox_closed:
+                sandbox_closed = True
+                try:
+                    self._sandbox_lifecycle.close()
+                except BaseException as error:
+                    cleanup_errors.append(self._error(error))
+                    cleanup_blocked = True
+                    if lease is not None:
+                        persist_recovery(f"sandbox cleanup unproven: {error}")
+            if (
+                drain_failed
+                or cleanup_blocked
+                or (
+                    work is not None
+                    and retention_attempted
+                    and not retained_identity_durable
+                )
+                or (lease is not None and lease.recovery_required)
+                or (evaluator is not None and evaluator.recovery_required)
+                or setup_recovery_required
+            ):
+                # Do not stop/unpause a paused parent while child containment is
+                # uncertain. Quiescence only pauses running Work or attests stop.
+                quiesce_parent()
+                return
+            if work is not None and not work_removed and not agent_stopped:
+                try:
+                    self._backend.stop_agent(work)
+                    agent_stopped = True
+                    close_attempt()
+                except BaseException as error:
+                    cleanup_errors.append(self._error(error))
+                    cleanup_blocked = True
+                    if lease is not None:
+                        persist_recovery(f"Agent stop is unproven: {error}")
+                    quiesce_parent()
+                    return
+            if not quiesce_parent():
+                return
+            if (
+                work is not None
+                and not work_removed
+                and not retention_attempted
+                and plan is not None
+            ):
+                retention_attempted = True
+                try:
+                    planned_retained_work = self._backend.plan_retained_work(plan, work)
+                    update_work(planned_retained_image_ref=planned_retained_work)
+                    retained_work = self._backend.retain_work(
+                        plan, work, planned_retained_work
+                    )
+                    if (
+                        retained_work.purpose != "retained-work"
+                        or retained_work.run_id != run_id
+                        or retained_work.task_id != plan.task.task_id
+                        or retained_work.round_id != retained_round_id("final", attempt)
+                        or retained_work.source_container_id != work.container_id
+                        or retained_work.image_ref != planned_retained_work
+                    ):
+                        mismatched = retained_work
+                        try:
+                            self._backend.release_retained_work(mismatched)
+                        except BaseException as rollback_error:
+                            retained_work_rollback = mismatched
+                            retained_work = None
+                            raise InfrastructureError(
+                                "retained Work image lease differs from durable "
+                                "plan; rollback failed: "
+                                f"{rollback_error}"
+                            ) from rollback_error
+                        retained_work = None
+                        raise InfrastructureError(
+                            "retained Work image lease differs from durable plan"
+                        )
+                    try:
+                        update_work(
+                            retained_image_id=retained_work.image_id,
+                            retained_image_ref=retained_work.image_ref,
+                        )
+                        retained_identity_durable = True
+                    except BaseException as identity_error:
+                        rollback_error: BaseException | None = None
+                        try:
+                            self._backend.release_retained_work(retained_work)
+                        except BaseException as error:
+                            rollback_error = error
+                        else:
+                            retained_work = None
+                        detail = (
+                            f"retained Work image identity fsync failed: "
+                            f"{identity_error}"
+                        )
+                        if rollback_error is not None:
+                            detail += (
+                                "; retained Work image rollback failed: "
+                                f"{rollback_error}"
+                            )
+                        raise InfrastructureError(detail) from identity_error
+                except BaseException as error:
+                    cleanup_errors.append(self._error(error))
+                    cleanup_blocked = True
+                    if lease is not None:
+                        persist_recovery(f"retained Work image failed: {error}")
+                    return
+            if work is not None and not work_removed:
+                try:
+                    self._backend.remove_work(work)
+                    work_removed = True
+                    update_work(
+                        container_id=None,
+                        planned_container=None,
+                        paused=False,
+                        paused_at=None,
+                        stopped=False,
+                    )
+                except BaseException as error:
+                    cleanup_errors.append(self._error(error))
+                    if lease is not None:
+                        persist_recovery(f"Work removal unproven: {error}")
+                    return
+            if work_policy_id is not None and not work_policy_removed:
+                try:
+                    self._backend.remove_work_policy(work_policy_id)
+                    work_policy_removed = True
+                    update_work(planned_policy_rule_id=None, policy_rule_id=None)
+                except BaseException as error:
+                    cleanup_errors.append(self._error(error))
+                    if lease is not None:
+                        persist_recovery(f"Work policy removal unproven: {error}")
+                    return
+            if network is not None and not network_removed:
+                try:
+                    self._backend.remove_network(network)
+                    network_removed = True
+                    update_work(
+                        network_id=None,
+                        network_name=None,
+                        planned_network=None,
+                    )
+                except BaseException as error:
+                    cleanup_errors.append(self._error(error))
+                    if lease is not None:
+                        persist_recovery(f"Work network removal unproven: {error}")
+                    return
+            if not sandbox_released:
+                try:
+                    self._sandbox_lifecycle.release_resources()
+                    sandbox_released = True
+                except BaseException as error:
+                    cleanup_errors.append(self._error(error))
+                    if lease is not None:
+                        persist_recovery(
+                            f"sandbox reservation release unproven: {error}"
+                        )
+
+        def emergency_cleanup() -> None:
+            nonlocal cleanup_blocked, work_quiescence
+            try:
+                cleanup_resources()
+            except BaseException:
+                cleanup_blocked = True
+                # A failed lease write must not leave already-owned Work
+                # executing. The last successful write remains our authority;
+                # this fallback only contains it, never releases resources or
+                # invents a durable observation. Unknown identities still fail
+                # closed before mutation.
+                if (
+                    work is not None
+                    and not work_removed
+                    and work_quiescence is None
+                    and lease is not None
+                    and lease.work.container_id == work.container_id
+                ):
+                    try:
+                        work_quiescence = WorkQuiescence(
+                            self._backend.quiesce_work(work)
+                        )
+                    except BaseException as error:
+                        cleanup_errors.append(self._error(error))
+                raise
+
+        try:
+            with _cancellation_signals(), self._leases.lock(run_id):
+                try:
+                    definition = self._backend.compile(request)
+                    gpu_plan = self._backend.allocate(
+                        definition, tuple(request.gpu_selectors)
+                    )
+                    coordinator_started_at = time.time()
+                    if resume is None:
+                        lease = ResourceLease(
+                            run_id=run_id,
+                            task_id=definition.task_id,
+                            coordinator_pid=os.getpid(),
+                            coordinator_started_at=coordinator_started_at,
+                            phase=RunStatus.PREPARING.value,
+                            gpu_plan=gpu_plan,
+                            attempts=(
+                                RunAttemptLease(
+                                    attempt=1, started_at=coordinator_started_at
+                                ),
+                            ),
+                        )
+                    else:
+                        resumed_from = self._leases.read(run_id)
+                        lease = self._resumed_lease(
+                            resumed_from,
+                            resume,
+                            gpu_plan=gpu_plan,
+                            started_at=coordinator_started_at,
+                        )
+                    write(lease)
+                    if self._on_lease_ready is not None:
+                        self._on_lease_ready(mutate_lease)
+                    self._backend.record_event("gpu_plan", gpu_plan)
+                    images = self._backend.prepare_images(definition)
+                    plan = self._backend.prepare_plan(
+                        definition, images, gpu_plan, request, run_id
+                    )
+                    validate_run_plan_mount_topology(plan)
+                    if resume is not None and (
+                        plan.task.verifier.max_submissions
+                        != resume.plan.task.verifier.max_submissions
+                    ):
+                        # The run's own plan decides: one final judge or not.
+                        raise SetupError(
+                            f"run {run_id}'s submission budget differs from "
+                            "its run plan"
+                        )
+                    final_judge = plan.task.verifier.final_judge
+                    if final_judge and resume is None:
+                        self._backend.record_event("final_judge_planned", None)
+                    budget = (
+                        plan.task.verifier.max_submissions
+                        if plan.task.verifier.max_submissions is not None
+                        else request.options.max_submissions
+                    )
+                    agent_timeout = (
+                        plan.task.agent.timeout_seconds
+                        if resume is None
+                        else resume.agent_seconds_left
+                    )
+                    mutate_lease(
+                        lambda current: current.model_copy(
+                            update={"rootfs_snapshot_mode": plan.rootfs_snapshot_mode}
+                        )
+                    )
+                    artifacts = self._backend.start_artifacts(plan, run_id)
+                    artifact_root = getattr(artifacts, "root", None)
+                    if isinstance(artifact_root, Path):
+                        mutate_lease(
+                            lambda current: current.model_copy(
+                                update={"artifact_root": artifact_root}
+                            )
+                        )
+                    evaluator = _RoundEvaluator(
+                        backend=self._backend,
+                        state=state,
+                        transition=transition,
+                        persist_recovery=persist_recovery,
+                        update_work=update_work,
+                        update_judge=update_judge,
+                        sandbox_lifecycle=self._sandbox_lifecycle,
+                    )
+                    server = self._backend.start_server(
+                        evaluator, artifacts, self._clock
+                    )
+                    resources.callback(emergency_cleanup)
+
+                    planned_network = self._backend.plan_network(plan, run_id)
+                    update_work(planned_network=planned_network)
+                    network = self._backend.create_network(
+                        plan, run_id, planned_network
+                    )
+                    update_work(
+                        network_id=network.network_id,
+                        network_name=network.name,
+                    )
+                    resources.callback(emergency_cleanup)
+
+                    if (
+                        resume is not None
+                        and plan.rootfs_snapshot_mode
+                        is RootfsSnapshotMode.SPLIT_WORKDIR
+                    ):
+                        # The run's kept WORKDIR volume: proven, never created.
+                        if resume.workdir_volume is None:
+                            raise InfrastructureError(
+                                "a resumed split-workdir run requires its kept "
+                                "WORKDIR volume"
+                            )
+                        planned_workdir_volume = resume.workdir_volume
+                        actual_workdir_volume = resume.workdir_volume
+                        workdir_volume_authority_known = True
+                        if (
+                            self._backend.adopt_workdir_volume(
+                                plan, run_id, resume.workdir_volume
+                            )
+                            != resume.workdir_volume
+                        ):
+                            raise InfrastructureError(
+                                "adopted WORKDIR volume differs from the run's lease"
+                            )
+                        evaluator.resource_event(
+                            "workdir_volume_created",
+                            planned=planned_workdir_volume,
+                            actual=actual_workdir_volume,
+                        )
+                    elif plan.rootfs_snapshot_mode is RootfsSnapshotMode.SPLIT_WORKDIR:
+                        planned_workdir_volume = self._backend.plan_workdir_volume(
+                            plan, run_id
+                        )
+                        workdir_volume_authority_known = True
+                        if planned_workdir_volume is None:
+                            raise InfrastructureError(
+                                "split-workdir mode requires planned WORKDIR "
+                                "volume authority"
+                            )
+                        try:
+                            evaluator.resource_event(
+                                "workdir_volume_planned",
+                                planned=planned_workdir_volume,
+                            )
+                        except BaseException as error:
+                            retain_workdir_authority_after_write_failure(
+                                "planned WORKDIR volume fsync failed", error
+                            )
+                            raise
+                        try:
+                            created_workdir_volume = (
+                                self._backend.create_workdir_volume(
+                                    plan,
+                                    run_id,
+                                    planned_workdir_volume,
+                                )
+                            )
+                        except InfrastructureError as error:
+                            retain_workdir_authority_after_write_failure(
+                                "WORKDIR volume create outcome is unproven",
+                                error,
+                            )
+                            raise
+                        except SetupError:
+                            planned_workdir_volume = None
+                            actual_workdir_volume = None
+                            rollback_workdir_volume = None
+                            workdir_volume_mounted = False
+                            evaluator.resource_event("workdir_volume_removed")
+                            raise
+                        if not isinstance(created_workdir_volume, ManagedWorkdirVolume):
+                            raise InfrastructureError(
+                                "WORKDIR volume create returned untyped authority"
+                            )
+                        if created_workdir_volume != planned_workdir_volume:
+                            mismatch = InfrastructureError(
+                                "created WORKDIR volume differs from exact "
+                                "split-workdir authority"
+                            )
+                            actual_workdir_volume = None
+                            rollback_workdir_volume = created_workdir_volume
+                            try:
+                                evaluator.resource_event(
+                                    "workdir_volume_created",
+                                    planned=planned_workdir_volume,
+                                    rollback=rollback_workdir_volume,
+                                )
+                            except BaseException as error:
+                                retain_workdir_authority_after_write_failure(
+                                    "mismatched WORKDIR volume rollback identity "
+                                    "fsync failed",
+                                    error,
+                                )
+                                raise
+                            try:
+                                self._backend.remove_workdir_volume(
+                                    rollback_workdir_volume
+                                )
+                            except BaseException as rollback_error:
+                                retain_workdir_authority_after_write_failure(
+                                    "mismatched WORKDIR volume rollback is unproven",
+                                    rollback_error,
+                                )
+                                raise InfrastructureError(
+                                    "recovery_required: mismatched WORKDIR volume "
+                                    "rollback is unproven: "
+                                    f"{rollback_error}"
+                                ) from mismatch
+                            planned_workdir_volume = None
+                            actual_workdir_volume = None
+                            rollback_workdir_volume = None
+                            workdir_volume_mounted = False
+                            evaluator.resource_event("workdir_volume_removed")
+                            raise mismatch
+                        actual_workdir_volume = created_workdir_volume
+                        rollback_workdir_volume = None
+                        try:
+                            evaluator.resource_event(
+                                "workdir_volume_created",
+                                planned=planned_workdir_volume,
+                                actual=actual_workdir_volume,
+                            )
+                        except BaseException as error:
+                            retain_workdir_authority_after_write_failure(
+                                "actual WORKDIR volume identity fsync failed",
+                                error,
+                            )
+                            raise
+                    elif (
+                        plan.rootfs_snapshot_mode is not RootfsSnapshotMode.FULL_ROOTFS
+                    ):
+                        raise InfrastructureError("unsupported rootfs snapshot mode")
+
+                    planned_work = self._backend.plan_work_container(plan, run_id)
+                    update_work(planned_container=planned_work)
+                    work = self._backend.create_work(
+                        plan,
+                        run_id,
+                        network,
+                        planned_work,
+                        actual_workdir_volume,
+                    )
+                    update_work(container_id=work.container_id)
+                    resources.callback(emergency_cleanup)
+                    self._backend.attest_work_feedback_mount(work)
+                    if actual_workdir_volume is not None:
+                        self._backend.attest_workdir_volume(work, actual_workdir_volume)
+                        workdir_volume_mounted = True
+                        try:
+                            evaluator.resource_event(
+                                "workdir_volume_mounted",
+                                actual=actual_workdir_volume,
+                            )
+                        except BaseException as error:
+                            retain_workdir_authority_after_write_failure(
+                                "mounted WORKDIR volume fsync failed", error
+                            )
+                            raise
+                    planned_work_policy = self._backend.plan_work_policy(
+                        plan, work, network
+                    )
+                    update_work(planned_policy_rule_id=planned_work_policy)
+                    try:
+                        work_policy_id = self._backend.install_work_policy(
+                            plan, work, network
+                        )
+                    except BaseException as error:
+                        if "recovery_required" in str(error):
+                            work_policy_id = planned_work_policy
+                            update_work(policy_rule_id=planned_work_policy)
+                            persist_recovery(str(error))
+                        raise
+                    if work_policy_id != planned_work_policy:
+                        raise InfrastructureError(
+                            "installed Work policy identity differs from plan"
+                        )
+                    update_work(policy_rule_id=work_policy_id)
+                    resources.callback(emergency_cleanup)
+                    self._backend.start_work(work)
+
+                    token = server.service.register(
+                        run_id=run_id,
+                        run_plan=plan,
+                        work_container=work,
+                        max_submissions=(
+                            budget if resume is None else resume.max_submissions
+                        ),
+                        final_judge=final_judge,
+                        cooldown_seconds=(
+                            request.options.cooldown_seconds
+                            if resume is None
+                            else resume.cooldown_seconds
+                        ),
+                        rounds_allocated=0 if resume is None else resume.charged_rounds,
+                        last_allocated_at=(
+                            None if resume is None else resume.last_allocated_at
+                        ),
+                        prior_reports=() if resume is None else resume.reports,
+                    )
+                    self._backend.install_hooks(plan, work, server.endpoint.url, token)
+                    prepared = self._backend.prepare_agent(
+                        plan,
+                        budget if resume is None else resume.submissions_left,
+                    )
+                    transition(RunStatus.AGENT_RUNNING)
+                    resources.callback(emergency_cleanup)
+                    ender = (
+                        _FinalRoundEnder(
+                            server.service.final_round_done,
+                            lambda: self._backend.end_agent(work),
+                        )
+                        if final_judge
+                        else None
+                    )
+                    # A final-judge Agent is ended once its one round
+                    # returns, whatever the round's outcome.
+                    held_ender = (
+                        None
+                        if final_judge
+                        else _RecoveryEnder(
+                            evaluator.work_held,
+                            lambda: self._backend.end_agent(work),
+                        )
+                    )
+                    agent_started_at = time.monotonic()
+                    try:
+                        agent_result = self._backend.run_agent(
+                            prepared, work, agent_timeout
+                        )
+                    finally:
+                        if ender is not None:
+                            ender.finish()
+                        if held_ender is not None:
+                            held_ender.finish()
+                    agent_runtime_seconds = max(
+                        0.0, time.monotonic() - agent_started_at
+                    )
+                    if ender is not None and ender.error is not None:
+                        raise ender.error
+                    if held_ender is not None and held_ender.ended:
+                        self._backend.record_event(
+                            "agent_ended_after_recovery_required", None
+                        )
+                    elif held_ender is not None and held_ender.error is not None:
+                        # The round already failed the attempt; the Agent
+                        # only ran out its time, as it did before.
+                        self._backend.record_event(
+                            "agent_end_after_recovery_required_failed",
+                            self._error(held_ender.error),
+                        )
+                    if final_judge and not agent_result.cancelled:
+                        # A round the Agent started may still be in flight,
+                        # and a busy Work may yet give it back.
+                        server.service.wait_for_round()
+                        if ender is not None and ender.ended:
+                            self._backend.record_event(
+                                "agent_ended_after_final_judge", None
+                            )
+                        elif server.service.attempt_has_round(
+                            0 if resume is None else resume.charged_rounds
+                        ):
+                            pass
+                        elif _judged_end(agent_result):
+                            # Work stops first: the judged state is the one
+                            # the Agent's time left, with nothing running.
+                            # Its time closes before the round, which runs
+                            # outside the Agent budget.
+                            self._backend.stop_agent(work)
+                            agent_stopped = True
+                            close_attempt()
+                            self._backend.record_event("final_judge_started", None)
+                            harness_judged = True
+                            _judge_final(server.service)
+                        else:
+                            error = AgentEndedEarlyError(
+                                "the Agent exited with code "
+                                f"{agent_result.exit_code} before its time "
+                                "ended; in a run with one final judge that "
+                                "attempt is not judged; resume the run to "
+                                "continue it"
+                            )
+                            self._backend.record_event("agent_ended_early", str(error))
+                            raise error
+                except (KeyboardInterrupt, _RunCancelled) as error:
+                    cancelled = True
+                    captured = error
+                except BaseException as error:
+                    captured = error
+
+                # Acceptance closes and all in-flight submissions drain before
+                # history, aggregation, artifacts, Agent, or Work are touched.
+                emergency_cleanup()
+                if (
+                    resume is not None
+                    and isinstance(captured, Exception)
+                    and artifacts is None
+                    and not cleanup_errors
+                ):
+                    # A resume refused or failed before its attempt's artifacts
+                    # exist leaves the run as it ended, to be resumed again.
+                    if lease is not None and resumed_from is not None:
+                        write(resumed_from)
+                    raise captured
+                # FAILED is this attempt's; best-of and the outcome span all.
+                reports = self._history(server, evaluator) if drained else ()
+                all_reports = reports if resume is None else (*resume.reports, *reports)
+                infrastructure_round = any(
+                    report.status == SubmissionStatus.INFRASTRUCTURE_ERROR
+                    for report in reports
+                )
+                if cancelled:
+                    terminal = RunStatus.CANCELLED
+                elif captured is not None or cleanup_errors or infrastructure_round:
+                    terminal = RunStatus.FAILED
+                elif agent_result is not None and agent_result.cancelled:
+                    terminal = RunStatus.CANCELLED
+                # The stop hook blocks voluntary exits, so exhausting the Agent
+                # budget is the normal end of a run; timed_out stays recorded
+                # in final_result.json and the outcome follows the submissions.
+                # With one final judge per attempt the newest round decides.
+                elif any(
+                    report.status == SubmissionStatus.COMPLETED
+                    for report in scored_reports(all_reports, final_judge)
+                ):
+                    terminal = RunStatus.COMPLETED
+                else:
+                    terminal = RunStatus.NO_VALID_SUBMISSION
+
+                engine_bug = isinstance(captured, StateTransitionError)
+                if engine_bug:
+                    terminal = RunStatus.FAILED
+                if artifacts is not None:
+                    diagnostic = "; ".join(
+                        tuple(cleanup_errors)
+                        + (() if captured is None else (self._error(captured),))
+                    )
+                    if diagnostic:
+                        try:
+                            artifacts.record_engine_error(diagnostic)
+                        except BaseException as error:
+                            cleanup_errors.append(self._error(error))
+                            terminal = RunStatus.FAILED
+                    first_round = (
+                        None if evaluator is None else evaluator.first_round_started
+                    )
+                    try:
+                        artifacts.finalize(
+                            status=terminal,
+                            runtime_seconds=max(0.0, time.monotonic() - started_at),
+                            timed_out=bool(agent_result and agent_result.timed_out),
+                            agent_exit_code=(
+                                None if agent_result is None else agent_result.exit_code
+                            ),
+                            agent_runtime_seconds=(
+                                agent_runtime_seconds
+                                if resume is None
+                                else resume.agent_seconds_used
+                                + (agent_runtime_seconds or 0.0)
+                            ),
+                            first_submission_seconds=(
+                                None
+                                if first_round is None
+                                or agent_started_at is None
+                                or harness_judged
+                                else max(0.0, first_round - agent_started_at)
+                            ),
+                            **({} if resume is None else {"attempts": attempt}),
+                            **_agent_provider_record(agent_result),
+                        )
+                    except BaseException as error:
+                        cleanup_errors.append(self._error(error))
+                        terminal = RunStatus.FAILED
+
+                if state.status not in _TERMINAL:
+                    transition(terminal)
+                if lease is not None:
+                    error_text = (
+                        None
+                        if captured is None and not cleanup_errors
+                        else "; ".join(
+                            tuple(cleanup_errors)
+                            + (() if captured is None else (self._error(captured),))
+                        )
+                    )
+                    mutate_lease(
+                        lambda current: current.model_copy(
+                            update={
+                                "phase": state.status.value,
+                                "status": state.status,
+                                "error": error_text,
+                                # An Agent cleanup could not contain stays
+                                # open for recover to charge.
+                                "attempts": (
+                                    closed_attempts(current)
+                                    if agent_contained()
+                                    else current.attempts
+                                ),
+                            }
+                        )
+                    )
+                result = aggregate_result(
+                    run_id=run_id,
+                    reports=all_reports,
+                    primary_reward=(
+                        None if plan is None else plan.task.verifier.primary_reward
+                    ),
+                    direction=(
+                        "maximize" if plan is None else plan.task.score_direction
+                    ),
+                    terminal=state.status,
+                    final_judge=final_judge,
+                ).model_copy(
+                    update={
+                        "agent_exit_code": (
+                            None if agent_result is None else agent_result.exit_code
+                        ),
+                        "artifacts_dir": (
+                            artifacts.root
+                            if isinstance(getattr(artifacts, "root", None), Path)
+                            else None
+                        ),
+                        "agent_stopped_by": (
+                            None
+                            if agent_result is None
+                            or agent_result.provider_error is None
+                            else describe_provider_stop(
+                                agent_result.provider_error,
+                                agent_result.provider_retries,
+                            )
+                        ),
+                    }
+                )
+                if engine_bug:
+                    assert isinstance(captured, StateTransitionError)
+                    raise captured
+                return result
+        finally:
+            resources.close()
+            self.phase_history = state.history
+
+    @staticmethod
+    def _resumed_lease(
+        current: ResourceLease | None,
+        resume: ResumeContext,
+        *,
+        gpu_plan: RunGPUPlan,
+        started_at: float,
+    ) -> ResourceLease:
+        """Carry the run's lease into the next attempt: the last retained
+        image joins the chain the new Work is built on. A run without one
+        (a cluster's) keeps its Work state on shared storage instead."""
+        work = None if current is None else current.work
+        chain = () if work is None else work.prior_retained_images
+        retained = resume.base_image_ref is not None
+        if retained and work is not None and work.retained_image_ref is not None:
+            assert work.retained_image_id is not None
+            chain += (
+                PriorRetainedImage(
+                    ref=work.retained_image_ref,
+                    id=work.retained_image_id,
+                    round_id=resume.base_image_round_id,
+                ),
+            )
+        if (
+            current is None
+            or work is None
+            or current.attempt != resume.attempt - 1
+            or current.status is None
+            or current.recovery_required
+            or any(entry.ended_at is None for entry in current.attempts)
+            or (
+                retained
+                and (
+                    not chain
+                    or (chain[-1].ref, chain[-1].id)
+                    != (resume.base_image_ref, resume.base_image_id)
+                )
+            )
+        ):
+            raise SetupError(
+                f"run {resume.run_id} changed after its resume was planned"
+            )
+        return current.model_copy(
+            update={
+                "coordinator_pid": os.getpid(),
+                "coordinator_started_at": started_at,
+                "phase": RunStatus.PREPARING.value,
+                "phase_history": (
+                    *current.phase_history,
+                    RunStatus.PREPARING.value,
+                ),
+                "status": None,
+                "error": None,
+                "gpu_plan": gpu_plan,
+                "attempt": resume.attempt,
+                "attempts": (
+                    *current.attempts,
+                    RunAttemptLease(
+                        attempt=resume.attempt,
+                        started_at=started_at,
+                        grants=resume.grants,
+                    ),
+                ),
+                "work": work.model_copy(
+                    update={
+                        "planned_retained_image_ref": None,
+                        "retained_image_id": None,
+                        "retained_image_ref": None,
+                        "prior_retained_images": chain,
+                    }
+                ),
+            }
+        )
+
+    @staticmethod
+    def _closed_attempts(
+        lease: ResourceLease, *, agent_seconds: float, exited: bool
+    ) -> tuple[RunAttemptLease, ...]:
+        """Close the current attempt with its Agent exec span, capped at the
+        deadline; an attempt already closed is kept."""
+        if not lease.attempts or lease.attempts[-1].ended_at is not None:
+            return lease.attempts
+        return (
+            *lease.attempts[:-1],
+            lease.attempts[-1].closed(
+                ended_at=time.time(),
+                basis="exited" if exited else "stopped",
+                agent_seconds=agent_seconds,
+            ),
+        )
+
+    @staticmethod
+    def _history(
+        server: StartedSubmissionServer | None,
+        evaluator: _RoundEvaluator | None,
+    ) -> tuple[SubmissionReport, ...]:
+        if server is not None:
+            reports = tuple(server.service.reports)
+            if reports:
+                return reports
+        return () if evaluator is None else tuple(evaluator.reports)
+
+    @staticmethod
+    def _error(error: BaseException) -> str:
+        return redact_text(f"{type(error).__name__}: {error}")
+
+
+def aggregate_result(
+    *,
+    run_id: str,
+    reports: Sequence[SubmissionReport],
+    primary_reward: str | None,
+    direction: Literal["maximize", "minimize"],
+    terminal: RunStatus | None = None,
+    final_judge: bool = False,
+) -> RunResult:
+    """Aggregate valid rewards per key without inventing a multi-objective
+    scalar; a final-judge run's from its newest round only."""
+    history = tuple(reports)
+    valid = tuple(
+        report
+        for report in scored_reports(history, final_judge)
+        if report.status == SubmissionStatus.COMPLETED
+    )
+    keys = {key for report in valid for key in report.rewards}
+    selected = primary_reward
+    if selected is None:
+        if "reward" in keys:
+            selected = "reward"
+        elif len(keys) == 1:
+            selected = next(iter(keys))
+
+    choose = min if direction == "minimize" else max
+    best_rewards = {
+        key: choose(report.rewards[key] for report in valid if key in report.rewards)
+        for key in sorted(keys)
+    }
+    scalar_candidates = (
+        ()
+        if selected is None
+        else tuple(report for report in valid if selected in report.rewards)
+    )
+    best_report: SubmissionReport | None = None
+    if scalar_candidates:
+        key = selected
+        assert key is not None
+
+        def ranking(report: SubmissionReport) -> float:
+            return report.rewards[key]
+
+        best_report = (
+            min(scalar_candidates, key=ranking)
+            if direction == "minimize"
+            else max(scalar_candidates, key=ranking)
+        )
+    status = terminal
+    if status is None:
+        status = RunStatus.COMPLETED if valid else RunStatus.NO_VALID_SUBMISSION
+    return RunResult(
+        run_id=run_id,
+        status=status,
+        total_rounds=len(history),
+        best_score=(
+            None
+            if best_report is None or selected is None
+            else best_report.rewards[selected]
+        ),
+        best_round=None if best_report is None else best_report.round_id,
+        best_rewards=FrozenRewardMap(best_rewards),
+        reports=history,
+    )
+
+
+__all__ = [
+    "CoordinatorBackend",
+    "CoordinatorState",
+    "EmbeddedSubmissionServerFactory",
+    "ProductionCoordinatorBackend",
+    "RoundLifecycleObserver",
+    "RunPreparation",
+    "RunCoordinator",
+    "StartedSubmissionServer",
+    "aggregate_result",
+]
